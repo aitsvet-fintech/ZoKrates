@@ -1,0 +1,18 @@
+import "./G" as G
+import "./SUM" as SUM
+
+// Not exactly the 256-bit Streebog, part of HMAC implementation:
+// treats the key as a 512-bit block, XORs it with with pad, then appends the message and the padding
+
+def main(u32 pad, u32[8] k, u32[8] m) -> u32[8]:
+    k = [ k[0] ^ pad, k[1] ^ pad, k[2] ^ pad, k[3] ^ pad, k[4] ^ pad, k[5] ^ pad, k[6] ^ pad, k[7] ^ pad ]
+    u32[16] Z = [0x00000000; 16]
+    u32[16] h = G([0x01010101; 16], Z, [ k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7],
+                                         pad, pad, pad, pad, pad, pad, pad, pad ])
+	u32[16] N = [0x00020000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,
+	             0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000]
+    h = G(h, N, [ m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7],
+                 0x01000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000])
+    N[0] = 0x00030000
+    h = G(G(h, Z, N), Z, SUM(pad, k, m))
+    return [ h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15] ]

@@ -1,0 +1,24 @@
+{
+	"entry_point": "./stdlib/hashes/streebog/X.zok",
+	"curves": ["Bn128"],
+	"tests": [
+		{
+			"input": {
+				"values": [
+                        "0xf43f6a88","0x85a308d3","0x13198a2e","0x03707344","0xa4093822","0x299f31d0","0x082efa98","0xec4e6c89",
+						"0x965354b5","0xa9f2dcc7","0x7e1a9106","0x6018aa0b","0x9c33ea93","0xc9d06da2","0xef5c25fd","0xc186b3c9",
+                        "0x965354b5","0xa9f2dcc7","0x7e1a9106","0x6018aa0b","0x9c33ea93","0xc9d06da2","0xef5c25fd","0xc186b3c9",
+						"0xf43f6a88","0x85a308d3","0x13198a2e","0x03707344","0xa4093822","0x299f31d0","0x082efa98","0xec4e6c89"
+				]
+			},
+			"output": {
+				"Ok": {
+					"values": [
+                        "0x626c3e3d","0x2c51d414","0x6d031b28","0x6368d94f","0x383ad2b1","0xe04f5c72","0xe772df65","0x2dc8df40",
+                        "0x626c3e3d","0x2c51d414","0x6d031b28","0x6368d94f","0x383ad2b1","0xe04f5c72","0xe772df65","0x2dc8df40"
+                    ]
+				}
+			}
+		}
+	]
+}

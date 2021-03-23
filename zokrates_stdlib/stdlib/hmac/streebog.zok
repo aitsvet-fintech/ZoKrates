@@ -1,0 +1,4 @@
+import "../hashes/streebog/256bit" as H
+
+def main(private u32[8] k, u32[8] m) -> u32[8]:
+    return H(0x5c5c5c5c, k, H(0x36363636, k, m))

@@ -1,0 +1,16 @@
+import "../hashes/mimc7/mimc7R90" as mimc7R90
+import "../utils/pack/u32/pack256" as pack
+import "../utils/pack/u32/nonStrictUnpack256" as unpack
+
+// Try mimic Streebog HMAC implementation which treats both the key and the message as 512-bit blocks
+
+def H(u32 pad, u32[8] k, u32[8] m) -> u32[8]:
+    return unpack(mimc7R90(pack([ 0x01000000, 0x00000000, 0x00000000, 0x00000000,
+                                  0x00000000, 0x00000000, 0x00000000, 0x00000000 ]),\
+                  mimc7R90(pack(m),\
+                  mimc7R90(pack([ pad, pad, pad, pad, pad, pad, pad, pad ]),\
+                  mimc7R90(pack([ k[0] ^ pad, k[1] ^ pad, k[2] ^ pad, k[3] ^ pad,
+                                  k[4] ^ pad, k[5] ^ pad, k[6] ^ pad, k[7] ^ pad]), 0)))))
+
+def main(private u32[8] k, u32[8] m) -> u32[8]:
+    return H(0x5c5c5c5c, k, H(0x36363636, k, m))

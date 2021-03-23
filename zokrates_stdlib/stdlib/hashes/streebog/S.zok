@@ -1,0 +1,132 @@
+// Streebog Pi lookup table, looks up least significant byte, outputs most significant byte
+
+def main(u32 a) -> u32:
+    return (if a & 0x80000000 == 0x80000000 then (if a & 0x40000000 == 0x40000000 then \
+    (if a & 0x20000000 == 0x20000000 then (if a & 0x10000000 == 0x10000000 then (if a & 0x08000000 == 0x08000000 then \
+    (if a & 0x04000000 == 0x04000000 then (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then \
+    0x000000b6 else 0x00000063 fi) else (if a & 0x01000000 == 0x01000000 then 0x0000004b else 0x00000039 fi) fi) else \
+    (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then 0x000000c2 else 0x000000af fi) else \
+    (if a & 0x01000000 == 0x01000000 then 0x00000066 else 0x000000d1 fi) fi) fi) else (if a & 0x04000000 == 0x04000000 then \
+    (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then 0x000000c0 else 0x000000b4 fi) else \
+    (if a & 0x01000000 == 0x01000000 then 0x000000f4 else 0x000000e6 fi) fi) else (if a & 0x02000000 == 0x02000000 then \
+    (if a & 0x01000000 == 0x01000000 then 0x000000d2 else 0x00000074 fi) else (if a & 0x01000000 == 0x01000000 then \
+    0x000000a6 else 0x00000059 fi) fi) fi) fi) else (if a & 0x08000000 == 0x08000000 then (if a & 0x04000000 == 0x04000000 then \
+    (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then 0x00000052 else 0x0000006c fi) else \
+    (if a & 0x01000000 == 0x01000000 then 0x000000e5 else 0x000000be fi) fi) else (if a & 0x02000000 == 0x02000000 then \
+    (if a & 0x01000000 == 0x01000000 then 0x000000d0 else 0x00000025 fi) else (if a & 0x01000000 == 0x01000000 then \
+    0x0000009b else 0x000000cb fi) fi) fi) else (if a & 0x04000000 == 0x04000000 then (if a & 0x02000000 == 0x02000000 then \
+    (if a & 0x01000000 == 0x01000000 then 0x0000005b else 0x00000009 fi) else (if a & 0x01000000 == 0x01000000 then \
+    0x0000002b else 0x0000002d fi) fi) else (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then \
+    0x000000a4 else 0x00000067 fi) else (if a & 0x01000000 == 0x01000000 then 0x00000071 else 0x00000020 fi) fi) fi) fi) fi) else \
+    (if a & 0x10000000 == 0x10000000 then (if a & 0x08000000 == 0x08000000 then (if a & 0x04000000 == 0x04000000 then \
+    (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then 0x00000061 else 0x00000085 fi) else \
+    (if a & 0x01000000 == 0x01000000 then 0x000000d8 else 0x000000ca fi) fi) else (if a & 0x02000000 == 0x02000000 then \
+    (if a & 0x01000000 == 0x01000000 then 0x00000090 else 0x000000aa fi) else (if a & 0x01000000 == 0x01000000 then \
+    0x00000053 else 0x0000008d fi) fi) fi) else (if a & 0x04000000 == 0x04000000 then (if a & 0x02000000 == 0x02000000 then \
+    (if a & 0x01000000 == 0x01000000 then 0x000000fe else 0x000000f8 fi) else (if a & 0x01000000 == 0x01000000 then \
+    0x0000003f else 0x0000004c fi) fi) else (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then \
+    0x00000049 else 0x00000083 fi) else (if a & 0x01000000 == 0x01000000 then 0x0000001b else 0x000000e1 fi) fi) fi) fi) else \
+    (if a & 0x08000000 == 0x08000000 then (if a & 0x04000000 == 0x04000000 then (if a & 0x02000000 == 0x02000000 then \
+    (if a & 0x01000000 == 0x01000000 then 0x00000089 else 0x000000e7 fi) else (if a & 0x01000000 == 0x01000000 then \
+    0x000000d9 else 0x00000088 fi) fi) else (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then \
+    0x000000e4 else 0x0000006b fi) else (if a & 0x01000000 == 0x01000000 then 0x00000037 else 0x00000030 fi) fi) fi) else \
+    (if a & 0x04000000 == 0x04000000 then (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then \
+    0x000000f7 else 0x0000001d fi) else (if a & 0x01000000 == 0x01000000 then 0x000000ac else 0x00000086 fi) fi) else \
+    (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then 0x00000040 else 0x000000b3 fi) else \
+    (if a & 0x01000000 == 0x01000000 then 0x00000058 else 0x00000007 fi) fi) fi) fi) fi) fi) else \
+    (if a & 0x20000000 == 0x20000000 then (if a & 0x10000000 == 0x10000000 then (if a & 0x08000000 == 0x08000000 then \
+    (if a & 0x04000000 == 0x04000000 then (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then \
+    0x0000003b else 0x00000095 fi) else (if a & 0x01000000 == 0x01000000 then 0x000000d5 else 0x00000069 fi) fi) else \
+    (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then 0x0000007d else 0x000000a5 fi) else \
+    (if a & 0x01000000 == 0x01000000 then 0x000000a3 else 0x0000008c fi) fi) fi) else (if a & 0x04000000 == 0x04000000 then \
+    (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then 0x0000002f else 0x00000055 fi) else \
+    (if a & 0x01000000 == 0x01000000 then 0x0000005e else 0x00000027 fi) fi) else (if a & 0x02000000 == 0x02000000 then \
+    (if a & 0x01000000 == 0x01000000 then 0x00000092 else 0x00000046 fi) else (if a & 0x01000000 == 0x01000000 then \
+    0x00000045 else 0x000000ad fi) fi) fi) fi) else (if a & 0x08000000 == 0x08000000 then (if a & 0x04000000 == 0x04000000 then \
+    (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then 0x00000041 else 0x00000026 fi) else \
+    (if a & 0x01000000 == 0x01000000 then 0x0000009f else 0x00000064 fi) fi) else (if a & 0x02000000 == 0x02000000 then \
+    (if a & 0x01000000 == 0x01000000 then 0x00000082 else 0x00000038 fi) else (if a & 0x01000000 == 0x01000000 then \
+    0x000000b8 else 0x0000001a fi) fi) fi) else (if a & 0x04000000 == 0x04000000 then (if a & 0x02000000 == 0x02000000 then \
+    (if a & 0x01000000 == 0x01000000 then 0x00000044 else 0x00000062 fi) else (if a & 0x01000000 == 0x01000000 then \
+    0x00000000 else 0x0000001e fi) fi) else (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then \
+    0x00000073 else 0x00000060 fi) else (if a & 0x01000000 == 0x01000000 then 0x00000097 else 0x000000a7 fi) fi) fi) fi) fi) else \
+    (if a & 0x10000000 == 0x10000000 then (if a & 0x08000000 == 0x08000000 then (if a & 0x04000000 == 0x04000000 then \
+    (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then 0x0000004a else 0x0000000a fi) else \
+    (if a & 0x01000000 == 0x01000000 then 0x00000033 else 0x0000004e fi) fi) else (if a & 0x02000000 == 0x02000000 then \
+    (if a & 0x01000000 == 0x01000000 then 0x00000050 else 0x00000028 fi) else (if a & 0x01000000 == 0x01000000 then \
+    0x000000e8 else 0x000000dc fi) fi) fi) else (if a & 0x04000000 == 0x04000000 then (if a & 0x02000000 == 0x02000000 then \
+    (if a & 0x01000000 == 0x01000000 then 0x000000bc else 0x000000b0 fi) else (if a & 0x01000000 == 0x01000000 then \
+    0x00000094 else 0x0000007a fi) fi) else (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then \
+    0x000000de else 0x000000ec fi) else (if a & 0x01000000 == 0x01000000 then 0x0000000f else 0x000000e0 fi) fi) fi) fi) else \
+    (if a & 0x08000000 == 0x08000000 then (if a & 0x04000000 == 0x04000000 then (if a & 0x02000000 == 0x02000000 then \
+    (if a & 0x01000000 == 0x01000000 then 0x00000003 else 0x000000b9 fi) else (if a & 0x01000000 == 0x01000000 then \
+    0x00000022 else 0x0000007c fi) fi) else (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then \
+    0x000000f6 else 0x000000d6 fi) else (if a & 0x01000000 == 0x01000000 then 0x00000079 else 0x000000d7 fi) fi) fi) else \
+    (if a & 0x04000000 == 0x04000000 then (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then \
+    0x000000c9 else 0x00000043 fi) else (if a & 0x01000000 == 0x01000000 then 0x000000a8 else 0x0000003e fi) fi) else \
+    (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then 0x000000a9 else 0x00000024 fi) else \
+    (if a & 0x01000000 == 0x01000000 then 0x000000f5 else 0x000000df fi) fi) fi) fi) fi) fi) fi) else \
+    (if a & 0x40000000 == 0x40000000 then (if a & 0x20000000 == 0x20000000 then (if a & 0x10000000 == 0x10000000 then \
+    (if a & 0x08000000 == 0x08000000 then (if a & 0x04000000 == 0x04000000 then (if a & 0x02000000 == 0x02000000 then \
+    (if a & 0x01000000 == 0x01000000 then 0x00000057 else 0x0000000d fi) else (if a & 0x01000000 == 0x01000000 then \
+    0x000000bd else 0x000000c3 fi) fi) else (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then \
+    0x00000080 else 0x000000c6 fi) else (if a & 0x01000000 == 0x01000000 then 0x00000054 else 0x0000006d fi) fi) fi) else \
+    (if a & 0x04000000 == 0x04000000 then (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then \
+    0x0000007e else 0x0000008a fi) else (if a & 0x01000000 == 0x01000000 then 0x00000035 else 0x000000ff fi) fi) else \
+    (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then 0x0000003d else 0x00000019 fi) else \
+    (if a & 0x01000000 == 0x01000000 then 0x00000075 else 0x00000032 fi) fi) fi) fi) else (if a & 0x08000000 == 0x08000000 then \
+    (if a & 0x04000000 == 0x04000000 then (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then \
+    0x000000b1 else 0x000000b2 fi) else (if a & 0x01000000 == 0x01000000 then 0x0000009e else 0x0000009d fi) fi) else \
+    (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then 0x0000006f else 0x00000078 fi) else \
+    (if a & 0x01000000 == 0x01000000 then 0x00000091 else 0x000000f3 fi) fi) fi) else (if a & 0x04000000 == 0x04000000 then \
+    (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then 0x000000c7 else 0x0000009a fi) else \
+    (if a & 0x01000000 == 0x01000000 then 0x0000007b else 0x00000010 fi) fi) else (if a & 0x02000000 == 0x02000000 then \
+    (if a & 0x01000000 == 0x01000000 then 0x00000029 else 0x00000096 fi) else (if a & 0x01000000 == 0x01000000 then \
+    0x000000a1 else 0x00000015 fi) fi) fi) fi) fi) else (if a & 0x10000000 == 0x10000000 then (if a & 0x08000000 == 0x08000000 then \
+    (if a & 0x04000000 == 0x04000000 then (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then \
+    0x00000087 else 0x0000005d fi) else (if a & 0x01000000 == 0x01000000 then 0x000000b7 else 0x0000009c fi) fi) else \
+    (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then 0x00000047 else 0x00000013 fi) else \
+    (if a & 0x01000000 == 0x01000000 then 0x00000072 else 0x000000bf fi) fi) fi) else (if a & 0x04000000 == 0x04000000 then \
+    (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then 0x00000012 else 0x00000076 fi) else \
+    (if a & 0x01000000 == 0x01000000 then 0x0000000c else 0x00000008 fi) fi) else (if a & 0x02000000 == 0x02000000 then \
+    (if a & 0x01000000 == 0x01000000 then 0x00000056 else 0x0000000e fi) else (if a & 0x01000000 == 0x01000000 then \
+    0x00000070 else 0x000000b5 fi) fi) fi) fi) else (if a & 0x08000000 == 0x08000000 then (if a & 0x04000000 == 0x04000000 then \
+    (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then 0x000000cc else 0x000000ce fi) else \
+    (if a & 0x01000000 == 0x01000000 then 0x0000003a else 0x000000fd fi) fi) else (if a & 0x02000000 == 0x02000000 then \
+    (if a & 0x01000000 == 0x01000000 then 0x000000a2 else 0x00000068 fi) else (if a & 0x01000000 == 0x01000000 then \
+    0x0000002a else 0x000000f2 fi) fi) fi) else (if a & 0x04000000 == 0x04000000 then (if a & 0x02000000 == 0x02000000 then \
+    (if a & 0x01000000 == 0x01000000 then 0x000000ab else 0x00000048 fi) else (if a & 0x01000000 == 0x01000000 then \
+    0x000000c8 else 0x000000ea fi) fi) else (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then \
+    0x00000051 else 0x0000002c fi) else (if a & 0x01000000 == 0x01000000 then 0x00000034 else 0x000000eb fi) fi) fi) fi) fi) fi) else \
+    (if a & 0x20000000 == 0x20000000 then (if a & 0x10000000 == 0x10000000 then (if a & 0x08000000 == 0x08000000 then \
+    (if a & 0x04000000 == 0x04000000 then (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then \
+    0x0000001f else 0x000000d3 fi) else (if a & 0x01000000 == 0x01000000 then 0x000000d4 else 0x0000007f fi) fi) else \
+    (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then 0x00000098 else 0x000000ed fi) else \
+    (if a & 0x01000000 == 0x01000000 then 0x0000000b else 0x00000006 fi) fi) fi) else (if a & 0x04000000 == 0x04000000 then \
+    (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then 0x000000a0 else 0x0000008f fi) else \
+    (if a & 0x01000000 == 0x01000000 then 0x0000006a else 0x000000e3 fi) fi) else (if a & 0x02000000 == 0x02000000 then \
+    (if a & 0x01000000 == 0x01000000 then 0x000000ae else 0x00000002 fi) else (if a & 0x01000000 == 0x01000000 then \
+    0x00000084 else 0x00000005 fi) fi) fi) fi) else (if a & 0x08000000 == 0x08000000 then (if a & 0x04000000 == 0x04000000 then \
+    (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then 0x0000004f else 0x0000008e fi) else \
+    (if a & 0x01000000 == 0x01000000 then 0x00000001 else 0x0000008b fi) fi) else (if a & 0x02000000 == 0x02000000 then \
+    (if a & 0x01000000 == 0x01000000 then 0x00000042 else 0x0000003c fi) else (if a & 0x01000000 == 0x01000000 then \
+    0x0000001c else 0x00000081 fi) fi) fi) else (if a & 0x04000000 == 0x04000000 then (if a & 0x02000000 == 0x02000000 then \
+    (if a & 0x01000000 == 0x01000000 then 0x00000021 else 0x000000ef fi) else (if a & 0x01000000 == 0x01000000 then \
+    0x0000005c else 0x000000e2 fi) fi) else (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then \
+    0x0000005a else 0x00000065 fi) else (if a & 0x01000000 == 0x01000000 then 0x00000018 else 0x000000f9 fi) fi) fi) fi) fi) else \
+    (if a & 0x10000000 == 0x10000000 then (if a & 0x08000000 == 0x08000000 then (if a & 0x04000000 == 0x04000000 then \
+    (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then 0x000000c1 else 0x0000005f fi) else \
+    (if a & 0x01000000 == 0x01000000 then 0x000000cd else 0x00000014 fi) fi) else (if a & 0x02000000 == 0x02000000 then \
+    (if a & 0x01000000 == 0x01000000 then 0x000000bb else 0x000000f1 fi) else (if a & 0x01000000 == 0x01000000 then \
+    0x00000036 else 0x00000017 fi) fi) fi) else (if a & 0x04000000 == 0x04000000 then (if a & 0x02000000 == 0x02000000 then \
+    (if a & 0x01000000 == 0x01000000 then 0x000000ba else 0x00000099 fi) else (if a & 0x01000000 == 0x01000000 then \
+    0x0000002e else 0x00000093 fi) fi) else (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then \
+    0x000000db else 0x000000f0 fi) else (if a & 0x01000000 == 0x01000000 then 0x00000077 else 0x000000e9 fi) fi) fi) fi) else \
+    (if a & 0x08000000 == 0x08000000 then (if a & 0x04000000 == 0x04000000 then (if a & 0x02000000 == 0x02000000 then \
+    (if a & 0x01000000 == 0x01000000 then 0x0000004d else 0x00000004 fi) else (if a & 0x01000000 == 0x01000000 then \
+    0x000000c5 else 0x00000023 fi) fi) else (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then \
+    0x000000da else 0x000000fa fi) else (if a & 0x01000000 == 0x01000000 then 0x000000c4 else 0x000000fb fi) fi) fi) else \
+    (if a & 0x04000000 == 0x04000000 then (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then \
+    0x00000016 else 0x00000031 fi) else (if a & 0x01000000 == 0x01000000 then 0x0000006e else 0x000000cf fi) fi) else \
+    (if a & 0x02000000 == 0x02000000 then (if a & 0x01000000 == 0x01000000 then 0x00000011 else 0x000000dd fi) else \
+    (if a & 0x01000000 == 0x01000000 then 0x000000ee else 0x000000fc fi) fi) fi) fi) fi) fi) fi) fi)

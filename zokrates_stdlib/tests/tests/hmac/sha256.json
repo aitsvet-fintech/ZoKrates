@@ -1,0 +1,21 @@
+{
+	"entry_point": "./stdlib/hmac/sha256.zok",
+	"curves": ["Bn128"],
+	"tests": [
+		{
+			"input": {
+				"values": [
+                        "0xcc84520b","0xd6feae43","0x45e345df","0xd016b784","0xa9d5db33","0xcec4fac1","0x55cfcdda","0x10c32a38",
+						"0xf43f6a88","0x85a308d3","0x13198a2e","0x03707344","0xa4093822","0x299f31d0","0x082efa98","0xec4e6c89"
+				]
+			},
+			"output": {
+				"Ok": {
+					"values": [
+						"0x22c812a5","0xf28aee4d","0xcf929040","0x1a8a22ca","0x0cf494f7","0x49b8685e","0xb6201775","0xf31f1eb4"
+                    ]
+				}
+			}
+		}
+	]
+}
