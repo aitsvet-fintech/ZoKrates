@@ -7,11 +7,11 @@ declare module 'zokrates-js' {
   export type G2Affine = [Fq2, Fq2];
   export type ProvingKey = Uint8Array;
 
-  export type SolidityAbi = "v1" | "v2";
   export type ResolveCallback = (location: string, path: string) => ResolverResult;
 
    export interface CompileConfig {
-      allow_unconstrained_variables?: boolean
+      allow_unconstrained_variables?: boolean,
+      isolate_branches?: boolean
    }
 
   export interface CompileOptions {
@@ -63,7 +63,7 @@ declare module 'zokrates-js' {
     compile(source: string, options?: CompileOptions): CompilationArtifacts;
     setup(program: Uint8Array): SetupKeypair;
     computeWitness(artifacts: CompilationArtifacts, args: any[]): ComputationResult;
-    exportSolidityVerifier(verificationKey: VerificationKey, abi: SolidityAbi): string;
+    exportSolidityVerifier(verificationKey: VerificationKey): string;
     generateProof(program: Uint8Array, witness: string, provingKey: Uint8Array): Proof;
     verify(verificationKey: VerificationKey, proof: Proof): boolean;
   }

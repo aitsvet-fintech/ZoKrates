@@ -1,3 +1,5 @@
+#![feature(panic_info_message)]
+#![feature(backtrace)]
 //
 // @file bin.rs
 // @author Jacob Eberhardt <jacob.eberhardt@tu-berlin.de>
@@ -11,10 +13,15 @@ mod constants;
 mod helpers;
 mod ops;
 
-use clap::{App, AppSettings};
+use clap::{App, AppSettings, Arg};
 use ops::*;
 
 fn main() {
+    // set a custom panic hook
+    std::panic::set_hook(Box::new(panic_hook));
+
+    env_logger::init();
+
     cli().unwrap_or_else(|e| {
         println!("{}", e);
         std::process::exit(1);
@@ -28,33 +35,76 @@ fn cli() -> Result<(), String> {
         .version(env!("CARGO_PKG_VERSION"))
         .author("Jacob Eberhardt, Thibaut Schaeffer, Stefan Deml, Darko Macesic")
         .about("Supports generation of zkSNARKs from high level language code including Smart Contracts for proof verification on the Ethereum Blockchain.\n'I know that I show nothing!'")
+        .arg(Arg::with_name("verbose")
+            .long("verbose")
+            .help("Verbose mode")
+            .required(false)
+            .global(true)
+        )
         .subcommands(vec![
             compile::subcommand(),
             check::subcommand(),
             compute_witness::subcommand(),
+            #[cfg(feature = "ark")]
+            universal_setup::subcommand(),
+            #[cfg(any(feature = "bellman", feature = "ark", feature = "libsnark"))]
             setup::subcommand(),
             export_verifier::subcommand(),
+            #[cfg(any(feature = "bellman", feature = "ark", feature = "libsnark"))]
             generate_proof::subcommand(),
+            generate_smtlib2::subcommand(),
             print_proof::subcommand(),
+            #[cfg(any(feature = "bellman", feature = "ark", feature = "libsnark"))]
             verify::subcommand()])
         .get_matches();
 
     match matches.subcommand() {
-        ("compile", Some(sub_matches)) => compile::exec(sub_matches)?,
-        ("check", Some(sub_matches)) => check::exec(sub_matches)?,
-        ("compute-witness", Some(sub_matches)) => compute_witness::exec(sub_matches)?,
+        ("compile", Some(sub_matches)) => compile::exec(sub_matches),
+        ("check", Some(sub_matches)) => check::exec(sub_matches),
+        ("compute-witness", Some(sub_matches)) => compute_witness::exec(sub_matches),
+        #[cfg(feature = "ark")]
+        ("universal-setup", Some(sub_matches)) => universal_setup::exec(sub_matches),
         #[cfg(any(feature = "bellman", feature = "ark", feature = "libsnark"))]
-        ("setup", Some(sub_matches)) => setup::exec(sub_matches)?,
-        ("export-verifier", Some(sub_matches)) => export_verifier::exec(sub_matches)?,
+        ("setup", Some(sub_matches)) => setup::exec(sub_matches),
+        ("export-verifier", Some(sub_matches)) => export_verifier::exec(sub_matches),
         #[cfg(any(feature = "bellman", feature = "ark", feature = "libsnark"))]
-        ("generate-proof", Some(sub_matches)) => generate_proof::exec(sub_matches)?,
-        ("print-proof", Some(sub_matches)) => print_proof::exec(sub_matches)?,
+        ("generate-proof", Some(sub_matches)) => generate_proof::exec(sub_matches),
+        ("generate-smtlib2", Some(sub_matches)) => generate_smtlib2::exec(sub_matches),
+        ("print-proof", Some(sub_matches)) => print_proof::exec(sub_matches),
         #[cfg(any(feature = "bellman", feature = "ark", feature = "libsnark"))]
-        ("verify", Some(sub_matches)) => verify::exec(sub_matches)?,
+        ("verify", Some(sub_matches)) => verify::exec(sub_matches),
         _ => unreachable!(),
-    };
+    }
+}
 
-    Ok(())
+fn panic_hook(pi: &std::panic::PanicInfo) {
+    let location = pi
+        .location()
+        .map(|l| format!("({})", l))
+        .unwrap_or_default();
+
+    let message = pi
+        .message()
+        .map(|m| format!("{}", m))
+        .or_else(|| pi.payload().downcast_ref::<&str>().map(|p| p.to_string()));
+
+    if let Some(s) = message {
+        println!("{} {}", s, location);
+    } else {
+        println!("The compiler unexpectedly panicked {}", location);
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        use std::backtrace::{Backtrace, BacktraceStatus};
+        let backtrace = Backtrace::capture();
+
+        if backtrace.status() == BacktraceStatus::Captured {
+            println!("rust backtrace:\n{}", backtrace);
+        }
+    }
+
+    println!("This is unexpected, please submit a full bug report at https://github.com/Zokrates/ZoKrates/issues");
 }
 
 #[cfg(test)]
@@ -86,11 +136,14 @@ mod tests {
                         continue;
                     }
 
-                    assert!(path.extension().expect("extension expected") == "zok");
-
-                    let should_error = path.to_str().unwrap().contains("compile_errors");
+                    if path.extension().expect("extension expected") == "sh" {
+                        continue;
+                    }
 
                     println!("Testing {:?}", path);
+                    assert_eq!(path.extension().expect("extension expected"), "zok");
+
+                    let should_error = path.to_str().unwrap().contains("compile_errors");
 
                     let file = File::open(path.clone()).unwrap();
 
@@ -110,6 +163,8 @@ mod tests {
                     assert_eq!(res.is_err(), should_error);
                 }
             })
+            .unwrap()
+            .join()
             .unwrap();
     }
 
@@ -121,7 +176,9 @@ mod tests {
                 Ok(x) => x,
                 Err(why) => panic!("Error: {:?}", why),
             };
+
             println!("Testing {:?}", path);
+            assert_eq!(path.extension().expect("extension expected"), "zok");
 
             let file = File::open(path.clone()).unwrap();
 
@@ -138,7 +195,7 @@ mod tests {
             let interpreter = ir::Interpreter::default();
 
             let _ = interpreter
-                .execute(&artifacts.prog(), &vec![Bn128Field::from(0)])
+                .execute(&artifacts.prog(), &[Bn128Field::from(0)])
                 .unwrap();
         }
     }
@@ -151,7 +208,9 @@ mod tests {
                 Ok(x) => x,
                 Err(why) => panic!("Error: {:?}", why),
             };
+
             println!("Testing {:?}", path);
+            assert_eq!(path.extension().expect("extension expected"), "zok");
 
             let file = File::open(path.clone()).unwrap();
 
@@ -167,7 +226,7 @@ mod tests {
 
             let interpreter = ir::Interpreter::default();
 
-            let res = interpreter.execute(&artifacts.prog(), &vec![Bn128Field::from(0)]);
+            let res = interpreter.execute(&artifacts.prog(), &[Bn128Field::from(0)]);
 
             assert!(res.is_err());
         }

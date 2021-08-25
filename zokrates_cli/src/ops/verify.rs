@@ -89,6 +89,18 @@ pub fn exec(sub_matches: &ArgMatches) -> Result<(), String> {
         Parameters(BackendParameter::Ark, CurveParameter::Bn128, SchemeParameter::GM17) => {
             cli_verify::<Bn128Field, GM17, Ark>(sub_matches)
         }
+        #[cfg(feature = "ark")]
+        Parameters(BackendParameter::Ark, CurveParameter::Bls12_377, SchemeParameter::MARLIN) => {
+            cli_verify::<Bls12_377Field, Marlin, Ark>(sub_matches)
+        }
+        #[cfg(feature = "ark")]
+        Parameters(BackendParameter::Ark, CurveParameter::Bw6_761, SchemeParameter::MARLIN) => {
+            cli_verify::<Bw6_761Field, Marlin, Ark>(sub_matches)
+        }
+        #[cfg(feature = "ark")]
+        Parameters(BackendParameter::Ark, CurveParameter::Bn128, SchemeParameter::MARLIN) => {
+            cli_verify::<Bn128Field, Marlin, Ark>(sub_matches)
+        }
         #[cfg(feature = "libsnark")]
         Parameters(BackendParameter::Libsnark, CurveParameter::Bn128, SchemeParameter::GM17) => {
             cli_verify::<Bn128Field, GM17, Libsnark>(sub_matches)
@@ -106,26 +118,26 @@ fn cli_verify<T: Field, S: Scheme<T>, B: Backend<T, S>>(
 ) -> Result<(), String> {
     let vk_path = Path::new(sub_matches.value_of("verification-key-path").unwrap());
     let vk_file = File::open(&vk_path)
-        .map_err(|why| format!("Couldn't open {}: {}", vk_path.display(), why))?;
+        .map_err(|why| format!("Could not open {}: {}", vk_path.display(), why))?;
 
     let vk_reader = BufReader::new(vk_file);
     let vk = serde_json::from_reader(vk_reader)
-        .map_err(|why| format!("Couldn't deserialize verification key: {}", why))?;
+        .map_err(|why| format!("Could not deserialize verification key: {}", why))?;
 
     let proof_path = Path::new(sub_matches.value_of("proof-path").unwrap());
     let proof_file = File::open(&proof_path)
-        .map_err(|why| format!("Couldn't open {}: {}", proof_path.display(), why))?;
+        .map_err(|why| format!("Could not open {}: {}", proof_path.display(), why))?;
 
     let proof_reader = BufReader::new(proof_file);
     let proof = serde_json::from_reader(proof_reader)
-        .map_err(|why| format!("Couldn't deserialize proof: {}", why))?;
+        .map_err(|why| format!("Could not deserialize proof: {}", why))?;
 
     println!("Performing verification...");
     println!(
-        "The verification result is: {}",
+        "{}",
         match B::verify(vk, proof) {
-            true => "PASS",
-            false => "FAIL",
+            true => "PASSED",
+            false => "FAILED",
         }
     );
 

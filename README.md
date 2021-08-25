@@ -1,10 +1,9 @@
 
-<img src="http://www.redaktion.tu-berlin.de/fileadmin/fg308/icons/projekte/logos/ZoKrates_logo.svg" width="100%" height="180">
+<img src="zokrates_logo.svg" width="100%" height="180">
 
 # ZoKrates
 
 [![Join the chat at https://gitter.im/ZoKrates/Lobby](https://badges.gitter.im/ZoKrates/Lobby.svg)](https://gitter.im/ZoKrates/Lobby?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
-[![CircleCI master](https://img.shields.io/circleci/project/github/Zokrates/ZoKrates/master.svg?label=master)](https://circleci.com/gh/Zokrates/ZoKrates/tree/master)
 [![CircleCI develop](https://img.shields.io/circleci/project/github/Zokrates/ZoKrates/develop.svg?label=develop)](https://circleci.com/gh/Zokrates/ZoKrates/tree/develop)
 
 ZoKrates is a toolbox for zkSNARKs on Ethereum.
@@ -22,7 +21,7 @@ curl -LSfs get.zokrat.es | sh
 ```
 
 Have a look at the [documentation](https://zokrates.github.io/) for more information about using ZoKrates.
-A getting started tutorial can be found [here](https://zokrates.github.io/sha256example.html).
+[Get started](https://zokrates.github.io/gettingstarted.html), then try a [tutorial](https://zokrates.github.io/examples/rng_tutorial.html)!
 
 ## Getting Help
 

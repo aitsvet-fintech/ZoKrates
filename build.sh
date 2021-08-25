@@ -3,4 +3,8 @@
 # Exit if any subcommand fails
 set -e
 
-cargo build
+if [ -n "$WITH_LIBSNARK" ]; then
+	cargo build --package zokrates_cli --features="libsnark"
+else
+	cargo build --package zokrates_cli
+fi

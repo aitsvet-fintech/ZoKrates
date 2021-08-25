@@ -51,34 +51,31 @@ fn bellman_combination<T: BellmanFieldExtensions, CS: ConstraintSystem<T::Bellma
         .map(|(k, v)| {
             (
                 v.into_bellman(),
-                symbols
-                    .entry(k)
-                    .or_insert_with(|| {
-                        match k.is_output() {
-                            true => cs.alloc_input(
-                                || format!("{}", k),
-                                || {
-                                    Ok(witness
-                                        .0
-                                        .remove(&k)
-                                        .ok_or(SynthesisError::AssignmentMissing)?
-                                        .into_bellman())
-                                },
-                            ),
-                            false => cs.alloc(
-                                || format!("{}", k),
-                                || {
-                                    Ok(witness
-                                        .0
-                                        .remove(&k)
-                                        .ok_or(SynthesisError::AssignmentMissing)?
-                                        .into_bellman())
-                                },
-                            ),
-                        }
-                        .unwrap()
-                    })
-                    .clone(),
+                *symbols.entry(k).or_insert_with(|| {
+                    match k.is_output() {
+                        true => cs.alloc_input(
+                            || format!("{}", k),
+                            || {
+                                Ok(witness
+                                    .0
+                                    .remove(&k)
+                                    .ok_or(SynthesisError::AssignmentMissing)?
+                                    .into_bellman())
+                            },
+                        ),
+                        false => cs.alloc(
+                            || format!("{}", k),
+                            || {
+                                Ok(witness
+                                    .0
+                                    .remove(&k)
+                                    .ok_or(SynthesisError::AssignmentMissing)?
+                                    .into_bellman())
+                            },
+                        ),
+                    }
+                    .unwrap()
+                }),
             )
         })
         .fold(LinearCombination::zero(), |acc, e| acc + e)
@@ -93,7 +90,7 @@ impl<T: BellmanFieldExtensions + Field> Prog<T> {
         // mapping from IR variables
         let mut symbols = BTreeMap::new();
 
-        let mut witness = witness.unwrap_or(Witness::empty());
+        let mut witness = witness.unwrap_or_else(Witness::empty);
 
         assert!(symbols.insert(FlatVariable::one(), CS::one()).is_none());
 
@@ -127,33 +124,29 @@ impl<T: BellmanFieldExtensions + Field> Prog<T> {
                         ),
                     }
                     .unwrap();
-                    (var.clone(), wire)
+                    (*var, wire)
                 }),
         );
 
         let main = self.main;
 
         for statement in main.statements {
-            match statement {
-                Statement::Constraint(quad, lin) => {
-                    let a = &bellman_combination(
-                        quad.left.into_canonical(),
-                        cs,
-                        &mut symbols,
-                        &mut witness,
-                    );
-                    let b = &bellman_combination(
-                        quad.right.into_canonical(),
-                        cs,
-                        &mut symbols,
-                        &mut witness,
-                    );
-                    let c =
-                        &bellman_combination(lin.into_canonical(), cs, &mut symbols, &mut witness);
+            if let Statement::Constraint(quad, lin, _) = statement {
+                let a = &bellman_combination(
+                    quad.left.into_canonical(),
+                    cs,
+                    &mut symbols,
+                    &mut witness,
+                );
+                let b = &bellman_combination(
+                    quad.right.into_canonical(),
+                    cs,
+                    &mut symbols,
+                    &mut witness,
+                );
+                let c = &bellman_combination(lin.into_canonical(), cs, &mut symbols, &mut witness);
 
-                    cs.enforce(|| "Constraint", |lc| lc + a, |lc| lc + b, |lc| lc + c);
-                }
-                _ => {}
+                cs.enforce(|| "Constraint", |lc| lc + a, |lc| lc + b, |lc| lc + c);
             }
         }
 
@@ -297,7 +290,7 @@ mod tests {
 
             let interpreter = Interpreter::default();
 
-            let witness = interpreter.execute(&program, &vec![]).unwrap();
+            let witness = interpreter.execute(&program, &[]).unwrap();
             let computation = Computation::with_witness(program, witness);
 
             let params = computation.clone().setup();
@@ -311,9 +304,9 @@ mod tests {
                     id: String::from("main"),
                     arguments: vec![FlatVariable::new(0)],
                     returns: vec![FlatVariable::public(0)],
-                    statements: vec![Statement::Constraint(
-                        FlatVariable::new(0).into(),
-                        FlatVariable::public(0).into(),
+                    statements: vec![Statement::constraint(
+                        FlatVariable::new(0),
+                        FlatVariable::public(0),
                     )],
                 },
                 private: vec![true],
@@ -322,7 +315,7 @@ mod tests {
             let interpreter = Interpreter::default();
 
             let witness = interpreter
-                .execute(&program, &vec![Bn128Field::from(0)])
+                .execute(&program, &[Bn128Field::from(0)])
                 .unwrap();
 
             let computation = Computation::with_witness(program, witness);
@@ -338,9 +331,9 @@ mod tests {
                     id: String::from("main"),
                     arguments: vec![FlatVariable::new(0)],
                     returns: vec![FlatVariable::public(0)],
-                    statements: vec![Statement::Constraint(
-                        FlatVariable::new(0).into(),
-                        FlatVariable::public(0).into(),
+                    statements: vec![Statement::constraint(
+                        FlatVariable::new(0),
+                        FlatVariable::public(0),
                     )],
                 },
                 private: vec![false],
@@ -349,7 +342,7 @@ mod tests {
             let interpreter = Interpreter::default();
 
             let witness = interpreter
-                .execute(&program, &vec![Bn128Field::from(0)])
+                .execute(&program, &[Bn128Field::from(0)])
                 .unwrap();
 
             let computation = Computation::with_witness(program, witness);
@@ -365,9 +358,9 @@ mod tests {
                     id: String::from("main"),
                     arguments: vec![],
                     returns: vec![FlatVariable::public(0)],
-                    statements: vec![Statement::Constraint(
-                        FlatVariable::one().into(),
-                        FlatVariable::public(0).into(),
+                    statements: vec![Statement::constraint(
+                        FlatVariable::one(),
+                        FlatVariable::public(0),
                     )],
                 },
                 private: vec![],
@@ -375,7 +368,7 @@ mod tests {
 
             let interpreter = Interpreter::default();
 
-            let witness = interpreter.execute(&program, &vec![]).unwrap();
+            let witness = interpreter.execute(&program, &[]).unwrap();
             let computation = Computation::with_witness(program, witness);
 
             let params = computation.clone().setup();
@@ -392,17 +385,15 @@ mod tests {
                     arguments: vec![FlatVariable::new(42), FlatVariable::new(51)],
                     returns: vec![FlatVariable::public(0), FlatVariable::public(1)],
                     statements: vec![
-                        Statement::Constraint(
-                            (LinComb::from(FlatVariable::new(42))
-                                + LinComb::from(FlatVariable::new(51)))
-                            .into(),
-                            FlatVariable::public(0).into(),
+                        Statement::constraint(
+                            LinComb::from(FlatVariable::new(42))
+                                + LinComb::from(FlatVariable::new(51)),
+                            FlatVariable::public(0),
                         ),
-                        Statement::Constraint(
-                            (LinComb::from(FlatVariable::one())
-                                + LinComb::from(FlatVariable::new(42)))
-                            .into(),
-                            FlatVariable::public(1).into(),
+                        Statement::constraint(
+                            LinComb::from(FlatVariable::one())
+                                + LinComb::from(FlatVariable::new(42)),
+                            FlatVariable::public(1),
                         ),
                     ],
                 },
@@ -412,7 +403,7 @@ mod tests {
             let interpreter = Interpreter::default();
 
             let witness = interpreter
-                .execute(&program, &vec![Bn128Field::from(3), Bn128Field::from(4)])
+                .execute(&program, &[Bn128Field::from(3), Bn128Field::from(4)])
                 .unwrap();
             let computation = Computation::with_witness(program, witness);
 
@@ -427,9 +418,9 @@ mod tests {
                     id: String::from("main"),
                     arguments: vec![FlatVariable::new(42)],
                     returns: vec![FlatVariable::public(0)],
-                    statements: vec![Statement::Constraint(
-                        (LinComb::from(FlatVariable::new(42)) + LinComb::one()).into(),
-                        FlatVariable::public(0).into(),
+                    statements: vec![Statement::constraint(
+                        LinComb::from(FlatVariable::new(42)) + LinComb::one(),
+                        FlatVariable::public(0),
                     )],
                 },
                 private: vec![false],
@@ -438,7 +429,7 @@ mod tests {
             let interpreter = Interpreter::default();
 
             let witness = interpreter
-                .execute(&program, &vec![Bn128Field::from(3)])
+                .execute(&program, &[Bn128Field::from(3)])
                 .unwrap();
 
             let computation = Computation::with_witness(program, witness);
@@ -454,11 +445,9 @@ mod tests {
                     id: String::from("main"),
                     arguments: vec![FlatVariable::new(42), FlatVariable::new(51)],
                     returns: vec![FlatVariable::public(0)],
-                    statements: vec![Statement::Constraint(
-                        (LinComb::from(FlatVariable::new(42))
-                            + LinComb::from(FlatVariable::new(51)))
-                        .into(),
-                        FlatVariable::public(0).into(),
+                    statements: vec![Statement::constraint(
+                        LinComb::from(FlatVariable::new(42)) + LinComb::from(FlatVariable::new(51)),
+                        FlatVariable::public(0),
                     )],
                 },
                 private: vec![true, false],
@@ -467,7 +456,7 @@ mod tests {
             let interpreter = Interpreter::default();
 
             let witness = interpreter
-                .execute(&program, &vec![Bn128Field::from(3), Bn128Field::from(4)])
+                .execute(&program, &[Bn128Field::from(3), Bn128Field::from(4)])
                 .unwrap();
             let computation = Computation::with_witness(program, witness);
 

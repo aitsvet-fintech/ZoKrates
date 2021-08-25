@@ -1,3 +1,5 @@
+#![allow(clippy::needless_collect)]
+
 //! Module containing the `Flattener` to process a program that is R1CS-able.
 //!
 //! @file flatten.rs
@@ -8,11 +10,13 @@
 mod utils;
 
 use self::utils::flat_expression_from_bits;
+use crate::ir::Interpreter;
 
 use crate::compile::CompileConfig;
+use crate::embed::FlatEmbed;
 use crate::flat_absy::*;
-use crate::solvers::{Executable, Solver};
-use crate::zir::types::{FunctionIdentifier, FunctionKey, Signature, Type, UBitwidth};
+use crate::solvers::Solver;
+use crate::zir::types::{Type, UBitwidth};
 use crate::zir::*;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -29,25 +33,25 @@ pub struct Flattener<'ast, T: Field> {
     next_var_idx: usize,
     /// `FlatVariable`s corresponding to each `Identifier`
     layout: HashMap<Identifier<'ast>, FlatVariable>,
-    /// Cached `FlatFunction`s to avoid re-flattening them
-    flat_cache: HashMap<FunctionKey<'ast>, FlatFunction<T>>,
     /// Cached bit decompositions to avoid re-generating them
     bits_cache: HashMap<FlatExpression<T>, Vec<FlatExpression<T>>>,
+    /// Cached flattened conditions for branches
+    condition_cache: HashMap<BooleanExpression<'ast, T>, FlatVariable>,
 }
 
 trait FlattenOutput<T: Field>: Sized {
-    fn flat(&self) -> FlatExpression<T>;
+    fn flat(self) -> FlatExpression<T>;
 }
 
 impl<T: Field> FlattenOutput<T> for FlatExpression<T> {
-    fn flat(&self) -> FlatExpression<T> {
-        self.clone()
+    fn flat(self) -> FlatExpression<T> {
+        self
     }
 }
 
 impl<T: Field> FlattenOutput<T> for FlatUExpression<T> {
-    fn flat(&self) -> FlatExpression<T> {
-        self.clone().get_field_unchecked()
+    fn flat(self) -> FlatExpression<T> {
+        self.get_field_unchecked()
     }
 }
 
@@ -59,7 +63,6 @@ trait Flatten<'ast, T: Field>: TryFrom<ZirExpression<'ast, T>, Error = ()> + IfE
     fn flatten(
         self,
         flattener: &mut Flattener<'ast, T>,
-        symbols: &ZirFunctionSymbols<'ast, T>,
         statements_flattened: &mut FlatStatements<T>,
     ) -> Self::Output;
 }
@@ -70,10 +73,9 @@ impl<'ast, T: Field> Flatten<'ast, T> for FieldElementExpression<'ast, T> {
     fn flatten(
         self,
         flattener: &mut Flattener<'ast, T>,
-        symbols: &ZirFunctionSymbols<'ast, T>,
         statements_flattened: &mut FlatStatements<T>,
     ) -> Self::Output {
-        flattener.flatten_field_expression(symbols, statements_flattened, self)
+        flattener.flatten_field_expression(statements_flattened, self)
     }
 }
 
@@ -83,10 +85,9 @@ impl<'ast, T: Field> Flatten<'ast, T> for UExpression<'ast, T> {
     fn flatten(
         self,
         flattener: &mut Flattener<'ast, T>,
-        symbols: &ZirFunctionSymbols<'ast, T>,
         statements_flattened: &mut FlatStatements<T>,
     ) -> Self::Output {
-        flattener.flatten_uint_expression(symbols, statements_flattened, self)
+        flattener.flatten_uint_expression(statements_flattened, self)
     }
 }
 
@@ -96,10 +97,9 @@ impl<'ast, T: Field> Flatten<'ast, T> for BooleanExpression<'ast, T> {
     fn flatten(
         self,
         flattener: &mut Flattener<'ast, T>,
-        symbols: &ZirFunctionSymbols<'ast, T>,
         statements_flattened: &mut FlatStatements<T>,
     ) -> Self::Output {
-        flattener.flatten_boolean_expression(symbols, statements_flattened, self)
+        flattener.flatten_boolean_expression(statements_flattened, self)
     }
 }
 
@@ -160,8 +160,8 @@ impl<'ast, T: Field> Flattener<'ast, T> {
             config,
             next_var_idx: 0,
             layout: HashMap::new(),
-            flat_cache: HashMap::new(),
             bits_cache: HashMap::new(),
+            condition_cache: HashMap::new(),
         }
     }
 
@@ -172,7 +172,7 @@ impl<'ast, T: Field> Flattener<'ast, T> {
         statements_flattened: &mut FlatStatements<T>,
     ) -> FlatVariable {
         match e {
-            FlatExpression::Identifier(id) => id.into(),
+            FlatExpression::Identifier(id) => id,
             e => {
                 let res = self.use_sym();
                 statements_flattened.push(FlatStatement::Definition(res, e));
@@ -181,36 +181,48 @@ impl<'ast, T: Field> Flattener<'ast, T> {
         }
     }
 
-    // Let's assume b = [1, 1, 1, 0]
-    //
-    // 1. Init `sizeUnknown = true`
-    //    As long as `sizeUnknown` is `true` we don't yet know if a is <= than b.
-    // 2. Loop over `b`:
-    //     * b[0] = 1
-    //       when `b` is 1 we check wether `a` is 0 in that particular run and update
-    //       `sizeUnknown` accordingly:
-    //       `sizeUnknown = sizeUnknown && a[0]`
-    //     * b[1] = 1
-    //       `sizrUnknown = sizeUnknown && a[1]`
-    //     * b[2] = 1
-    //       `sizeUnknown = sizeUnknown && a[2]`
-    //     * b[3] = 0
-    //       we need to enforce that `a` is 0 in case `sizeUnknown`is still `true`,
-    //       otherwise `a` can be {0,1}:
-    //      `true == (!sizeUnknown || !a[3])`
-    //      ```
-    //                     **true => a -> 0
-    //         sizeUnkown *
-    //                     **false => a -> {0,1}
-    //      ```
-    fn strict_le_check(
+    /// Compute a range check between the bid endian decomposition of an expression and the
+    /// big endian decomposition of a constant
+    ///
+    /// # Arguments
+    /// * `a` - the big-endian bit decomposition of the expression to check against the range
+    /// * `b` - the big-endian bit decomposition of the upper bound we're checking against
+    ///
+    /// # Returns
+    /// * a vector of FlatExpression which all evaluate to `1` if `a <= b` and `0` otherwise
+    ///
+    /// # Notes
+    ///
+    /// Algorithm from [the sapling spec](https://github.com/zcash/zips/blob/master/protocol/sapling.pdf) A.3.2.2
+    ///
+    /// Let's assume b = [1, 1, 1, 0]
+    ///
+    /// 1. Init `sizeUnknown = true`
+    ///    As long as `sizeUnknown` is `true` we don't yet know if a is <= than b.
+    /// 2. Loop over `b`:
+    ///     * b[0] = 1
+    ///       when `b` is 1 we check wether `a` is 0 in that particular run and update
+    ///       `sizeUnknown` accordingly:
+    ///       `sizeUnknown = sizeUnknown && a[0]`
+    ///     * b[1] = 1
+    ///       `sizeUnknown = sizeUnknown && a[1]`
+    ///     * b[2] = 1
+    ///       `sizeUnknown = sizeUnknown && a[2]`
+    ///     * b[3] = 0
+    ///       we need to enforce that `a` is 0 in case `sizeUnknown`is still `true`,
+    ///       otherwise `a` can be {0,1}:
+    ///      `true == (!sizeUnknown || !a[3])`
+    ///                   **true => a -> 0
+    ///      sizeUnkown *
+    ///                   **false => a -> {0,1}
+    #[must_use]
+    fn constant_le_check(
         &mut self,
         statements_flattened: &mut FlatStatements<T>,
+        a: &[FlatVariable],
         b: &[bool],
-        a: Vec<FlatVariable>,
-    ) {
+    ) -> Vec<FlatExpression<T>> {
         let len = b.len();
-        assert_eq!(a.len(), T::get_required_bits());
         assert_eq!(a.len(), b.len());
 
         let mut is_not_smaller_run = vec![];
@@ -227,11 +239,13 @@ impl<'ast, T: Field> Flattener<'ast, T> {
             FlatExpression::Number(T::from(1)),
         ));
 
+        let mut res = vec![];
+
         for (i, b) in b.iter().enumerate() {
             if *b {
                 statements_flattened.push(FlatStatement::Definition(
                     is_not_smaller_run[i],
-                    a[i].clone().into(),
+                    a[i].into(),
                 ));
 
                 // don't need to update size_unknown in the last round
@@ -251,21 +265,16 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                         // sizeUnknown is not changing in this case
                         // We sill have to assign the old value to the variable of the current run
                         // This trivial definition will later be removed by the optimiser
-                        FlatStatement::Definition(
-                            size_unknown[i + 1].into(),
-                            size_unknown[i].into(),
-                        ),
+                        FlatStatement::Definition(size_unknown[i + 1], size_unknown[i].into()),
                     );
                 }
 
                 let or_left = FlatExpression::Sub(
                     box FlatExpression::Number(T::from(1)),
-                    box size_unknown[i].clone().into(),
+                    box size_unknown[i].into(),
                 );
-                let or_right: FlatExpression<_> = FlatExpression::Sub(
-                    box FlatExpression::Number(T::from(1)),
-                    box a[i].clone().into(),
-                );
+                let or_right: FlatExpression<_> =
+                    FlatExpression::Sub(box FlatExpression::Number(T::from(1)), box a[i].into());
 
                 let and_name = self.use_sym();
                 let and = FlatExpression::Mult(box or_left.clone(), box or_right.clone());
@@ -275,19 +284,155 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                     box and_name.into(),
                 );
 
-                statements_flattened.push(FlatStatement::Condition(
-                    FlatExpression::Number(T::from(1)),
-                    or,
-                ));
+                res.push(or);
             }
         }
+
+        res
+    }
+
+    /// Compute an equality check between two expressions
+    ///
+    /// # Arguments
+    ///
+    /// * `statements_flattened` - Vector where new flattened statements can be added.
+    /// * `left - the first `FlatExpression`
+    /// * `right` - the second `FlatExpression`
+    ///
+    /// # Returns
+    /// * A FlatExpression which evaluates to `1` if `left == right`, `0` otherwise
+    fn eq_check(
+        &mut self,
+        statements_flattened: &mut Vec<FlatStatement<T>>,
+        left: FlatExpression<T>,
+        right: FlatExpression<T>,
+    ) -> FlatExpression<T> {
+        let left = self.define(left, statements_flattened);
+        let right = self.define(right, statements_flattened);
+
+        // Wanted: (Y = (X != 0) ? 1 : 0)
+        // X = a - b
+        // # Y = if X == 0 then 0 else 1 fi
+        // # M = if X == 0 then 1 else 1/X fi
+        // Y == X * M
+        // 0 == (1-Y) * X
+
+        let x = FlatExpression::Sub(box left.into(), box right.into());
+
+        let name_y = self.use_sym();
+        let name_m = self.use_sym();
+
+        statements_flattened.push(FlatStatement::Directive(FlatDirective::new(
+            vec![name_y, name_m],
+            Solver::ConditionEq,
+            vec![x.clone()],
+        )));
+        statements_flattened.push(FlatStatement::Condition(
+            FlatExpression::Identifier(name_y),
+            FlatExpression::Mult(box x.clone(), box FlatExpression::Identifier(name_m)),
+            RuntimeError::Equal,
+        ));
+
+        let res = FlatExpression::Sub(
+            box FlatExpression::Number(T::one()),
+            box FlatExpression::Identifier(name_y),
+        );
+
+        statements_flattened.push(FlatStatement::Condition(
+            FlatExpression::Number(T::zero()),
+            FlatExpression::Mult(box res.clone(), box x),
+            RuntimeError::Equal,
+        ));
+
+        res
+    }
+
+    /// Enforce a range check against a constant: the range check isn't verified iff a constraint will fail
+    ///
+    /// # Arguments
+    ///
+    /// * `statements_flattened` - Vector where new flattened statements can be added.
+    /// * `a` - the big-endian bit decomposition of the expression we enforce to be in range
+    /// * `b` - the big-endian bit decomposition of the upper bound of the range
+    fn enforce_constant_le_check(
+        &mut self,
+        statements_flattened: &mut FlatStatements<T>,
+        a: &[FlatVariable],
+        b: &[bool],
+    ) {
+        let conditions = self.constant_le_check(statements_flattened, a, b);
+
+        let conditions_count = conditions.len();
+
+        let conditions_sum = conditions
+            .into_iter()
+            .fold(FlatExpression::from(T::zero()), |acc, e| {
+                FlatExpression::Add(box acc, box e)
+            });
+        statements_flattened.push(FlatStatement::Condition(
+            FlatExpression::Number(T::from(0)),
+            FlatExpression::Sub(box conditions_sum, box T::from(conditions_count).into()),
+            RuntimeError::Le,
+        ));
+    }
+
+    fn make_conditional(
+        &mut self,
+        statements: Vec<FlatStatement<T>>,
+        condition: FlatExpression<T>,
+    ) -> Vec<FlatStatement<T>> {
+        statements
+            .into_iter()
+            .flat_map(|s| match s {
+                FlatStatement::Condition(left, right, message) => {
+                    let mut output = vec![];
+
+                    // we transform (a == b) into (c => (a == b)) which is (!c || (a == b))
+
+                    // let's introduce new variables to make sure everything is linear
+                    let name_left = self.define(left, &mut output);
+                    let name_right = self.define(right, &mut output);
+
+                    // let's introduce an expression which is 1 iff `a == b`
+                    let y = FlatExpression::Add(
+                        box FlatExpression::Sub(box name_left.into(), box name_right.into()),
+                        box T::one().into(),
+                    );
+                    // let's introduce !c
+                    let x = FlatExpression::Sub(box T::one().into(), box condition.clone());
+
+                    assert!(x.is_linear() && y.is_linear());
+                    let name_x_or_y = self.use_sym();
+                    output.push(FlatStatement::Directive(FlatDirective {
+                        solver: Solver::Or,
+                        outputs: vec![name_x_or_y],
+                        inputs: vec![x.clone(), y.clone()],
+                    }));
+                    output.push(FlatStatement::Condition(
+                        FlatExpression::Add(
+                            box x.clone(),
+                            box FlatExpression::Sub(box y.clone(), box name_x_or_y.into()),
+                        ),
+                        FlatExpression::Mult(box x.clone(), box y.clone()),
+                        RuntimeError::BranchIsolation,
+                    ));
+                    output.push(FlatStatement::Condition(
+                        name_x_or_y.into(),
+                        T::one().into(),
+                        message,
+                    ));
+
+                    output
+                }
+                s => vec![s],
+            })
+            .collect()
     }
 
     /// Flatten an if/else expression
     ///
     /// # Arguments
     ///
-    /// * `symbols` - Available functions in this context
     /// * `statements_flattened` - Vector where new flattened statements can be added.
     /// * `condition` - the condition as a `BooleanExpression`.
     /// * `consequence` - the consequence of type U.
@@ -296,20 +441,48 @@ impl<'ast, T: Field> Flattener<'ast, T> {
     /// * U is the type of the expression
     fn flatten_if_else_expression<U: Flatten<'ast, T>>(
         &mut self,
-        symbols: &ZirFunctionSymbols<'ast, T>,
         statements_flattened: &mut FlatStatements<T>,
         condition: BooleanExpression<'ast, T>,
         consequence: U,
         alternative: U,
     ) -> FlatUExpression<T> {
-        let condition = self.flatten_boolean_expression(symbols, statements_flattened, condition);
-
-        let consequence = consequence.flatten(self, symbols, statements_flattened);
-
-        let alternative = alternative.flatten(self, symbols, statements_flattened);
+        let condition_flat =
+            self.flatten_boolean_expression(statements_flattened, condition.clone());
 
         let condition_id = self.use_sym();
-        statements_flattened.push(FlatStatement::Definition(condition_id, condition));
+        statements_flattened.push(FlatStatement::Definition(condition_id, condition_flat));
+
+        self.condition_cache.insert(condition, condition_id);
+
+        let (consequence, alternative) = if self.config.isolate_branches {
+            let mut consequence_statements = vec![];
+
+            let consequence = consequence.flatten(self, &mut consequence_statements);
+
+            let mut alternative_statements = vec![];
+
+            let alternative = alternative.flatten(self, &mut alternative_statements);
+
+            let consequence_statements =
+                self.make_conditional(consequence_statements, condition_id.into());
+            let alternative_statements = self.make_conditional(
+                alternative_statements,
+                FlatExpression::Sub(
+                    box FlatExpression::Number(T::one()),
+                    box condition_id.into(),
+                ),
+            );
+
+            statements_flattened.extend(consequence_statements);
+            statements_flattened.extend(alternative_statements);
+
+            (consequence, alternative)
+        } else {
+            (
+                consequence.flatten(self, statements_flattened),
+                alternative.flatten(self, statements_flattened),
+            )
+        };
 
         let consequence = consequence.flat();
         let alternative = alternative.flat();
@@ -324,7 +497,7 @@ impl<'ast, T: Field> Flattener<'ast, T> {
         statements_flattened.push(FlatStatement::Definition(
             term0_id,
             FlatExpression::Mult(
-                box condition_id.clone().into(),
+                box condition_id.into(),
                 box FlatExpression::from(consequence_id),
             ),
         ));
@@ -356,11 +529,115 @@ impl<'ast, T: Field> Flattener<'ast, T> {
         }
     }
 
+    /// Compute a strict check against a constant
+    /// # Arguments
+    /// * `statements_flattened` - Vector where new flattened statements can be added.
+    /// * `e` - the `FlatExpression` that's being checked against the range.
+    /// * `c` - the constant strict upper bound of the range
+    ///
+    /// # Returns
+    /// * a `FlatExpression` which evaluates to `1` if `0 <= e < c`, and to `0` otherwise
+    fn constant_lt_check(
+        &mut self,
+        statements_flattened: &mut FlatStatements<T>,
+        e: FlatExpression<T>,
+        c: T,
+    ) -> FlatExpression<T> {
+        if c == T::zero() {
+            // this is the case c == 0, we return 0, aka false
+            return T::zero().into();
+        }
+
+        self.constant_field_le_check(statements_flattened, e, c - T::one())
+    }
+
+    /// Compute a range check against a constant
+    ///
+    /// # Arguments
+    ///
+    /// * `statements_flattened` - Vector where new flattened statements can be added.
+    /// * `e` - the `FlatExpression` that's being checked against the range.
+    /// * `c` - the constant upper bound of the range
+    ///
+    /// # Returns
+    /// * a `FlatExpression` which evaluates to `1` if `0 <= e <= c`, and to `0` otherwise
+    fn constant_field_le_check(
+        &mut self,
+        statements_flattened: &mut FlatStatements<T>,
+        e: FlatExpression<T>,
+        c: T,
+    ) -> FlatExpression<T> {
+        let bit_width = T::get_required_bits();
+        // decompose e to bits
+        let e_id = self.define(e, statements_flattened);
+
+        // define variables for the bits
+        let e_bits_be: Vec<FlatVariable> = (0..bit_width).map(|_| self.use_sym()).collect();
+
+        // add a directive to get the bits
+        statements_flattened.push(FlatStatement::Directive(FlatDirective::new(
+            e_bits_be.clone(),
+            Solver::bits(bit_width),
+            vec![e_id],
+        )));
+
+        // bitness checks
+        for bit in e_bits_be.iter().take(bit_width) {
+            statements_flattened.push(FlatStatement::Condition(
+                FlatExpression::Identifier(*bit),
+                FlatExpression::Mult(
+                    box FlatExpression::Identifier(*bit),
+                    box FlatExpression::Identifier(*bit),
+                ),
+                RuntimeError::ConstantLtBitness,
+            ));
+        }
+
+        // bit decomposition check
+        let mut e_sum = FlatExpression::Number(T::from(0));
+
+        for (i, bit) in e_bits_be.iter().take(bit_width).enumerate() {
+            e_sum = FlatExpression::Add(
+                box e_sum,
+                box FlatExpression::Mult(
+                    box FlatExpression::Identifier(*bit),
+                    box FlatExpression::Number(T::from(2).pow(bit_width - i - 1)),
+                ),
+            );
+        }
+
+        statements_flattened.push(FlatStatement::Condition(
+            FlatExpression::Identifier(e_id),
+            e_sum,
+            RuntimeError::ConstantLtSum,
+        ));
+
+        // check that this decomposition does not overflow the field
+        self.enforce_constant_le_check(
+            statements_flattened,
+            &e_bits_be,
+            &T::max_value().bit_vector_be(),
+        );
+
+        let conditions =
+            self.constant_le_check(statements_flattened, &e_bits_be, &c.bit_vector_be());
+
+        // return `len(conditions) == sum(conditions)`
+        self.eq_check(
+            statements_flattened,
+            T::from(conditions.len()).into(),
+            conditions
+                .into_iter()
+                .fold(FlatExpression::Number(T::zero()), |acc, e| {
+                    FlatExpression::Add(box acc, box e)
+                }),
+        )
+    }
+
     /// Flattens a boolean expression
     ///
     /// # Arguments
     ///
-    /// * `symbols` - Available functions in this context
     /// * `statements_flattened` - Vector where new flattened statements can be added.
     /// * `expression` - `BooleanExpression` that will be flattened.
     ///
@@ -370,184 +647,219 @@ impl<'ast, T: Field> Flattener<'ast, T> {
     /// * in order to preserve composability.
     fn flatten_boolean_expression(
         &mut self,
-        symbols: &ZirFunctionSymbols<'ast, T>,
         statements_flattened: &mut FlatStatements<T>,
         expression: BooleanExpression<'ast, T>,
     ) -> FlatExpression<T> {
-        // those will be booleans in the future
+        // check the cache
+        if let Some(c) = self.condition_cache.get(&expression) {
+            return (*c).into();
+        }
+
         match expression {
             BooleanExpression::Identifier(x) => {
-                FlatExpression::Identifier(self.layout.get(&x).unwrap().clone())
+                FlatExpression::Identifier(*self.layout.get(&x).unwrap())
             }
-            BooleanExpression::Lt(box lhs, box rhs) => {
+            BooleanExpression::Select(a, box index) => self
+                .flatten_select_expression(statements_flattened, a, index)
+                .get_field_unchecked(),
+            BooleanExpression::FieldLt(box lhs, box rhs) => {
                 // Get the bit width to know the size of the binary decompositions for this Field
                 let bit_width = T::get_required_bits();
-                let safe_width = bit_width - 2; // making sure we don't overflow, assert here?
 
                 // We know from semantic checking that lhs and rhs have the same type
                 // What the expression will flatten to depends on that type
 
-                let lhs_flattened =
-                    self.flatten_field_expression(symbols, statements_flattened, lhs);
-                let rhs_flattened =
-                    self.flatten_field_expression(symbols, statements_flattened, rhs);
+                let lhs_flattened = self.flatten_field_expression(statements_flattened, lhs);
+                let rhs_flattened = self.flatten_field_expression(statements_flattened, rhs);
 
-                // lhs
-                let lhs_id = self.define(lhs_flattened, statements_flattened);
-
-                // check that lhs and rhs are within the right range, i.e., their higher two bits are zero. We use big-endian so they are at positions 0 and 1
-
-                // lhs
-                {
-                    // define variables for the bits
-                    let lhs_bits_be: Vec<FlatVariable> =
-                        (0..safe_width).map(|_| self.use_sym()).collect();
-
-                    // add a directive to get the bits
-                    statements_flattened.push(FlatStatement::Directive(FlatDirective::new(
-                        lhs_bits_be.clone(),
-                        Solver::bits(safe_width),
-                        vec![lhs_id],
-                    )));
-
-                    // bitness checks
-                    for i in 0..safe_width {
-                        statements_flattened.push(FlatStatement::Condition(
-                            FlatExpression::Identifier(lhs_bits_be[i]),
-                            FlatExpression::Mult(
-                                box FlatExpression::Identifier(lhs_bits_be[i]),
-                                box FlatExpression::Identifier(lhs_bits_be[i]),
-                            ),
-                        ));
+                match (lhs_flattened, rhs_flattened) {
+                    (x, FlatExpression::Number(constant)) => {
+                        self.constant_lt_check(statements_flattened, x, constant)
                     }
+                    // (c < x <= p - 1) <=> (0 <= p - 1 - x < p - 1 - c)
+                    (FlatExpression::Number(constant), x) => self.constant_lt_check(
+                        statements_flattened,
+                        FlatExpression::Sub(box T::max_value().into(), box x),
+                        T::max_value() - constant,
+                    ),
+                    (lhs_flattened, rhs_flattened) => {
+                        let safe_width = bit_width - 2; // dynamic comparison is not complete, it only applies to words of width `bit_width - 2`
 
-                    // bit decomposition check
-                    let mut lhs_sum = FlatExpression::Number(T::from(0));
+                        // lhs
+                        let lhs_id = self.define(lhs_flattened, statements_flattened);
 
-                    for i in 0..safe_width {
-                        lhs_sum = FlatExpression::Add(
-                            box lhs_sum,
+                        // check that lhs and rhs are within the right range, i.e., their higher two bits are zero. We use big-endian so they are at positions 0 and 1
+
+                        // lhs
+                        {
+                            // define variables for the bits
+                            let lhs_bits_be: Vec<FlatVariable> =
+                                (0..safe_width).map(|_| self.use_sym()).collect();
+
+                            // add a directive to get the bits
+                            statements_flattened.push(FlatStatement::Directive(
+                                FlatDirective::new(
+                                    lhs_bits_be.clone(),
+                                    Solver::bits(safe_width),
+                                    vec![lhs_id],
+                                ),
+                            ));
+
+                            // bitness checks
+                            for bit in lhs_bits_be.iter().take(safe_width) {
+                                statements_flattened.push(FlatStatement::Condition(
+                                    FlatExpression::Identifier(*bit),
+                                    FlatExpression::Mult(
+                                        box FlatExpression::Identifier(*bit),
+                                        box FlatExpression::Identifier(*bit),
+                                    ),
+                                    RuntimeError::LtBitness,
+                                ));
+                            }
+
+                            // bit decomposition check
+                            let mut lhs_sum = FlatExpression::Number(T::from(0));
+
+                            for (i, bit) in lhs_bits_be.iter().take(safe_width).enumerate() {
+                                lhs_sum = FlatExpression::Add(
+                                    box lhs_sum,
+                                    box FlatExpression::Mult(
+                                        box FlatExpression::Identifier(*bit),
+                                        box FlatExpression::Number(
+                                            T::from(2).pow(safe_width - i - 1),
+                                        ),
+                                    ),
+                                );
+                            }
+
+                            statements_flattened.push(FlatStatement::Condition(
+                                FlatExpression::Identifier(lhs_id),
+                                lhs_sum,
+                                RuntimeError::LtSum,
+                            ));
+                        }
+
+                        // rhs
+                        let rhs_id = self.define(rhs_flattened, statements_flattened);
+
+                        // rhs
+                        {
+                            // define variables for the bits
+                            let rhs_bits_be: Vec<FlatVariable> =
+                                (0..safe_width).map(|_| self.use_sym()).collect();
+
+                            // add a directive to get the bits
+                            statements_flattened.push(FlatStatement::Directive(
+                                FlatDirective::new(
+                                    rhs_bits_be.clone(),
+                                    Solver::bits(safe_width),
+                                    vec![rhs_id],
+                                ),
+                            ));
+
+                            // bitness checks
+                            for bit in rhs_bits_be.iter().take(safe_width) {
+                                statements_flattened.push(FlatStatement::Condition(
+                                    FlatExpression::Identifier(*bit),
+                                    FlatExpression::Mult(
+                                        box FlatExpression::Identifier(*bit),
+                                        box FlatExpression::Identifier(*bit),
+                                    ),
+                                    RuntimeError::LtBitness,
+                                ));
+                            }
+
+                            // bit decomposition check
+                            let mut rhs_sum = FlatExpression::Number(T::from(0));
+
+                            for (i, bit) in rhs_bits_be.iter().take(safe_width).enumerate() {
+                                rhs_sum = FlatExpression::Add(
+                                    box rhs_sum,
+                                    box FlatExpression::Mult(
+                                        box FlatExpression::Identifier(*bit),
+                                        box FlatExpression::Number(
+                                            T::from(2).pow(safe_width - i - 1),
+                                        ),
+                                    ),
+                                );
+                            }
+
+                            statements_flattened.push(FlatStatement::Condition(
+                                FlatExpression::Identifier(rhs_id),
+                                rhs_sum,
+                                RuntimeError::LtSum,
+                            ));
+                        }
+
+                        // sym := (lhs * 2) - (rhs * 2)
+                        let subtraction_result = FlatExpression::Sub(
                             box FlatExpression::Mult(
-                                box FlatExpression::Identifier(lhs_bits_be[i]),
-                                box FlatExpression::Number(T::from(2).pow(safe_width - i - 1)),
+                                box FlatExpression::Number(T::from(2)),
+                                box FlatExpression::Identifier(lhs_id),
+                            ),
+                            box FlatExpression::Mult(
+                                box FlatExpression::Number(T::from(2)),
+                                box FlatExpression::Identifier(rhs_id),
                             ),
                         );
-                    }
 
-                    statements_flattened.push(FlatStatement::Condition(
-                        FlatExpression::Identifier(lhs_id),
-                        lhs_sum,
-                    ));
-                }
+                        // define variables for the bits
+                        let sub_bits_be: Vec<FlatVariable> =
+                            (0..bit_width).map(|_| self.use_sym()).collect();
 
-                // rhs
-                let rhs_id = self.define(rhs_flattened, statements_flattened);
+                        // add a directive to get the bits
+                        statements_flattened.push(FlatStatement::Directive(FlatDirective::new(
+                            sub_bits_be.clone(),
+                            Solver::bits(bit_width),
+                            vec![subtraction_result.clone()],
+                        )));
 
-                // rhs
-                {
-                    // define variables for the bits
-                    let rhs_bits_be: Vec<FlatVariable> =
-                        (0..safe_width).map(|_| self.use_sym()).collect();
+                        // bitness checks
+                        for bit in sub_bits_be.iter().take(bit_width) {
+                            statements_flattened.push(FlatStatement::Condition(
+                                FlatExpression::Identifier(*bit),
+                                FlatExpression::Mult(
+                                    box FlatExpression::Identifier(*bit),
+                                    box FlatExpression::Identifier(*bit),
+                                ),
+                                RuntimeError::LtFinalBitness,
+                            ));
+                        }
 
-                    // add a directive to get the bits
-                    statements_flattened.push(FlatStatement::Directive(FlatDirective::new(
-                        rhs_bits_be.clone(),
-                        Solver::bits(safe_width),
-                        vec![rhs_id],
-                    )));
-
-                    // bitness checks
-                    for i in 0..safe_width {
-                        statements_flattened.push(FlatStatement::Condition(
-                            FlatExpression::Identifier(rhs_bits_be[i]),
-                            FlatExpression::Mult(
-                                box FlatExpression::Identifier(rhs_bits_be[i]),
-                                box FlatExpression::Identifier(rhs_bits_be[i]),
-                            ),
-                        ));
-                    }
-
-                    // bit decomposition check
-                    let mut rhs_sum = FlatExpression::Number(T::from(0));
-
-                    for i in 0..safe_width {
-                        rhs_sum = FlatExpression::Add(
-                            box rhs_sum,
-                            box FlatExpression::Mult(
-                                box FlatExpression::Identifier(rhs_bits_be[i]),
-                                box FlatExpression::Number(T::from(2).pow(safe_width - i - 1)),
-                            ),
+                        // check that the decomposition is in the field with a strict `< p` checks
+                        self.enforce_constant_le_check(
+                            statements_flattened,
+                            &sub_bits_be,
+                            &T::max_value().bit_vector_be(),
                         );
+
+                        // sum(sym_b{i} * 2**i)
+                        let mut expr = FlatExpression::Number(T::from(0));
+
+                        for (i, bit) in sub_bits_be.iter().take(bit_width).enumerate() {
+                            expr = FlatExpression::Add(
+                                box expr,
+                                box FlatExpression::Mult(
+                                    box FlatExpression::Identifier(*bit),
+                                    box FlatExpression::Number(T::from(2).pow(bit_width - i - 1)),
+                                ),
+                            );
+                        }
+
+                        statements_flattened.push(FlatStatement::Condition(
+                            subtraction_result,
+                            expr,
+                            RuntimeError::LtFinalSum,
+                        ));
+
+                        FlatExpression::Identifier(sub_bits_be[bit_width - 1])
                     }
-
-                    statements_flattened.push(FlatStatement::Condition(
-                        FlatExpression::Identifier(rhs_id),
-                        rhs_sum,
-                    ));
                 }
-
-                // sym := (lhs * 2) - (rhs * 2)
-                let subtraction_result = FlatExpression::Sub(
-                    box FlatExpression::Mult(
-                        box FlatExpression::Number(T::from(2)),
-                        box FlatExpression::Identifier(lhs_id),
-                    ),
-                    box FlatExpression::Mult(
-                        box FlatExpression::Number(T::from(2)),
-                        box FlatExpression::Identifier(rhs_id),
-                    ),
-                );
-
-                // define variables for the bits
-                let sub_bits_be: Vec<FlatVariable> =
-                    (0..bit_width).map(|_| self.use_sym()).collect();
-
-                // add a directive to get the bits
-                statements_flattened.push(FlatStatement::Directive(FlatDirective::new(
-                    sub_bits_be.clone(),
-                    Solver::bits(bit_width),
-                    vec![subtraction_result.clone()],
-                )));
-
-                // bitness checks
-                for i in 0..bit_width {
-                    statements_flattened.push(FlatStatement::Condition(
-                        FlatExpression::Identifier(sub_bits_be[i]),
-                        FlatExpression::Mult(
-                            box FlatExpression::Identifier(sub_bits_be[i]),
-                            box FlatExpression::Identifier(sub_bits_be[i]),
-                        ),
-                    ));
-                }
-
-                // check that the decomposition is in the field with a strict `< p` checks
-                self.strict_le_check(
-                    statements_flattened,
-                    &T::max_value_bit_vector_be(),
-                    sub_bits_be.clone(),
-                );
-
-                // sum(sym_b{i} * 2**i)
-                let mut expr = FlatExpression::Number(T::from(0));
-
-                for i in 0..bit_width {
-                    expr = FlatExpression::Add(
-                        box expr,
-                        box FlatExpression::Mult(
-                            box FlatExpression::Identifier(sub_bits_be[i]),
-                            box FlatExpression::Number(T::from(2).pow(bit_width - i - 1)),
-                        ),
-                    );
-                }
-
-                statements_flattened.push(FlatStatement::Condition(subtraction_result, expr));
-
-                FlatExpression::Identifier(sub_bits_be[bit_width - 1])
             }
             BooleanExpression::BoolEq(box lhs, box rhs) => {
                 // lhs and rhs are booleans, they flatten to 0 or 1
-                let x = self.flatten_boolean_expression(symbols, statements_flattened, lhs);
-                let y = self.flatten_boolean_expression(symbols, statements_flattened, rhs);
+                let x = self.flatten_boolean_expression(statements_flattened, lhs);
+                let y = self.flatten_boolean_expression(statements_flattened, rhs);
                 // Wanted: Not(X - Y)**2 which is an XNOR
                 // We know that X and Y are [0, 1]
                 // (X - Y) can become a negative values, which is why squaring the result is needed
@@ -577,43 +889,11 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                 )
             }
             BooleanExpression::FieldEq(box lhs, box rhs) => {
-                // Wanted: (Y = (X != 0) ? 1 : 0)
-                // X = a - b
-                // # Y = if X == 0 then 0 else 1 fi
-                // # M = if X == 0 then 1 else 1/X fi
-                // Y == X * M
-                // 0 == (1-Y) * X
+                let lhs = self.flatten_field_expression(statements_flattened, lhs);
 
-                let name_y = self.use_sym();
-                let name_m = self.use_sym();
+                let rhs = self.flatten_field_expression(statements_flattened, rhs);
 
-                let x = self.flatten_field_expression(
-                    symbols,
-                    statements_flattened,
-                    FieldElementExpression::Sub(box lhs, box rhs),
-                );
-
-                statements_flattened.push(FlatStatement::Directive(FlatDirective::new(
-                    vec![name_y, name_m],
-                    Solver::ConditionEq,
-                    vec![x.clone()],
-                )));
-                statements_flattened.push(FlatStatement::Condition(
-                    FlatExpression::Identifier(name_y),
-                    FlatExpression::Mult(box x.clone(), box FlatExpression::Identifier(name_m)),
-                ));
-
-                let res = FlatExpression::Sub(
-                    box FlatExpression::Number(T::one()),
-                    box FlatExpression::Identifier(name_y),
-                );
-
-                statements_flattened.push(FlatStatement::Condition(
-                    FlatExpression::Number(T::zero()),
-                    FlatExpression::Mult(box res.clone(), box x),
-                ));
-
-                res
+                self.eq_check(statements_flattened, lhs, rhs)
             }
             BooleanExpression::UintEq(box lhs, box rhs) => {
                 // We reduce each side into range and apply the same approach as for field elements
@@ -625,69 +905,134 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                 // Y == X * M
                 // 0 == (1-Y) * X
 
-                let name_y = self.use_sym();
-                let name_m = self.use_sym();
-
-                assert!(lhs.metadata.clone().unwrap().should_reduce.to_bool());
-                assert!(rhs.metadata.clone().unwrap().should_reduce.to_bool());
+                assert!(lhs.metadata.as_ref().unwrap().should_reduce.to_bool());
+                assert!(rhs.metadata.as_ref().unwrap().should_reduce.to_bool());
 
                 let lhs = self
-                    .flatten_uint_expression(symbols, statements_flattened, lhs)
+                    .flatten_uint_expression(statements_flattened, lhs)
                     .get_field_unchecked();
                 let rhs = self
-                    .flatten_uint_expression(symbols, statements_flattened, rhs)
+                    .flatten_uint_expression(statements_flattened, rhs)
                     .get_field_unchecked();
 
-                let x = FlatExpression::Sub(box lhs, box rhs);
-
-                statements_flattened.push(FlatStatement::Directive(FlatDirective::new(
-                    vec![name_y, name_m],
-                    Solver::ConditionEq,
-                    vec![x.clone()],
-                )));
-                statements_flattened.push(FlatStatement::Condition(
-                    FlatExpression::Identifier(name_y),
-                    FlatExpression::Mult(box x.clone(), box FlatExpression::Identifier(name_m)),
-                ));
-
-                let res = FlatExpression::Sub(
-                    box FlatExpression::Number(T::one()),
-                    box FlatExpression::Identifier(name_y),
-                );
-
-                statements_flattened.push(FlatStatement::Condition(
-                    FlatExpression::Number(T::zero()),
-                    FlatExpression::Mult(box res.clone(), box x),
-                ));
-
-                res
+                self.eq_check(statements_flattened, lhs, rhs)
             }
-            BooleanExpression::Le(box lhs, box rhs) => {
+            BooleanExpression::FieldLe(box lhs, box rhs) => {
                 let lt = self.flatten_boolean_expression(
-                    symbols,
                     statements_flattened,
-                    BooleanExpression::Lt(box lhs.clone(), box rhs.clone()),
+                    BooleanExpression::FieldLt(box lhs.clone(), box rhs.clone()),
                 );
                 let eq = self.flatten_boolean_expression(
-                    symbols,
                     statements_flattened,
-                    BooleanExpression::FieldEq(box lhs.clone(), box rhs.clone()),
+                    BooleanExpression::FieldEq(box lhs, box rhs),
                 );
                 FlatExpression::Add(box eq, box lt)
             }
-            BooleanExpression::Gt(lhs, rhs) => self.flatten_boolean_expression(
-                symbols,
+            BooleanExpression::FieldGt(lhs, rhs) => self.flatten_boolean_expression(
                 statements_flattened,
-                BooleanExpression::Lt(rhs, lhs),
+                BooleanExpression::FieldLt(rhs, lhs),
             ),
-            BooleanExpression::Ge(lhs, rhs) => self.flatten_boolean_expression(
-                symbols,
+            BooleanExpression::FieldGe(lhs, rhs) => self.flatten_boolean_expression(
                 statements_flattened,
-                BooleanExpression::Le(rhs, lhs),
+                BooleanExpression::FieldLe(rhs, lhs),
+            ),
+            BooleanExpression::UintLt(box lhs, box rhs) => {
+                let lhs_flattened = self.flatten_uint_expression(statements_flattened, lhs);
+                let rhs_flattened = self.flatten_uint_expression(statements_flattened, rhs);
+
+                // Get the bit width to know the size of the binary decompositions for this Field
+                // This is not this uint bitwidth
+                let bit_width = T::get_required_bits();
+
+                // lhs
+                let lhs_id = self.define(lhs_flattened.get_field_unchecked(), statements_flattened);
+                let rhs_id = self.define(rhs_flattened.get_field_unchecked(), statements_flattened);
+
+                // sym := (lhs * 2) - (rhs * 2)
+                let subtraction_result = FlatExpression::Sub(
+                    box FlatExpression::Mult(
+                        box FlatExpression::Number(T::from(2)),
+                        box FlatExpression::Identifier(lhs_id),
+                    ),
+                    box FlatExpression::Mult(
+                        box FlatExpression::Number(T::from(2)),
+                        box FlatExpression::Identifier(rhs_id),
+                    ),
+                );
+
+                // define variables for the bits
+                let sub_bits_be: Vec<FlatVariable> =
+                    (0..bit_width).map(|_| self.use_sym()).collect();
+
+                // add a directive to get the bits
+                statements_flattened.push(FlatStatement::Directive(FlatDirective::new(
+                    sub_bits_be.clone(),
+                    Solver::bits(bit_width),
+                    vec![subtraction_result.clone()],
+                )));
+
+                // bitness checks
+                for bit in sub_bits_be.iter().take(bit_width) {
+                    statements_flattened.push(FlatStatement::Condition(
+                        FlatExpression::Identifier(*bit),
+                        FlatExpression::Mult(
+                            box FlatExpression::Identifier(*bit),
+                            box FlatExpression::Identifier(*bit),
+                        ),
+                        RuntimeError::LtFinalBitness,
+                    ));
+                }
+
+                // check that the decomposition is in the field with a strict `< p` checks
+                self.enforce_constant_le_check(
+                    statements_flattened,
+                    &sub_bits_be,
+                    &T::max_value().bit_vector_be(),
+                );
+
+                // sum(sym_b{i} * 2**i)
+                let mut expr = FlatExpression::Number(T::from(0));
+
+                for (i, bit) in sub_bits_be.iter().enumerate().take(bit_width) {
+                    expr = FlatExpression::Add(
+                        box expr,
+                        box FlatExpression::Mult(
+                            box FlatExpression::Identifier(*bit),
+                            box FlatExpression::Number(T::from(2).pow(bit_width - i - 1)),
+                        ),
+                    );
+                }
+
+                statements_flattened.push(FlatStatement::Condition(
+                    subtraction_result,
+                    expr,
+                    RuntimeError::LtFinalSum,
+                ));
+
+                FlatExpression::Identifier(sub_bits_be[bit_width - 1])
+            }
+            BooleanExpression::UintLe(box lhs, box rhs) => {
+                let lt = self.flatten_boolean_expression(
+                    statements_flattened,
+                    BooleanExpression::UintLt(box lhs.clone(), box rhs.clone()),
+                );
+                let eq = self.flatten_boolean_expression(
+                    statements_flattened,
+                    BooleanExpression::UintEq(box lhs, box rhs),
+                );
+                FlatExpression::Add(box eq, box lt)
+            }
+            BooleanExpression::UintGt(lhs, rhs) => self.flatten_boolean_expression(
+                statements_flattened,
+                BooleanExpression::UintLt(rhs, lhs),
+            ),
+            BooleanExpression::UintGe(lhs, rhs) => self.flatten_boolean_expression(
+                statements_flattened,
+                BooleanExpression::UintLe(rhs, lhs),
             ),
             BooleanExpression::Or(box lhs, box rhs) => {
-                let x = self.flatten_boolean_expression(symbols, statements_flattened, lhs);
-                let y = self.flatten_boolean_expression(symbols, statements_flattened, rhs);
+                let x = self.flatten_boolean_expression(statements_flattened, lhs);
+                let y = self.flatten_boolean_expression(statements_flattened, rhs);
                 assert!(x.is_linear() && y.is_linear());
                 let name_x_or_y = self.use_sym();
                 statements_flattened.push(FlatStatement::Directive(FlatDirective {
@@ -698,15 +1043,16 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                 statements_flattened.push(FlatStatement::Condition(
                     FlatExpression::Add(
                         box x.clone(),
-                        box FlatExpression::Sub(box y.clone(), box name_x_or_y.clone().into()),
+                        box FlatExpression::Sub(box y.clone(), box name_x_or_y.into()),
                     ),
-                    FlatExpression::Mult(box x.clone(), box y.clone()),
+                    FlatExpression::Mult(box x, box y),
+                    RuntimeError::Or,
                 ));
                 name_x_or_y.into()
             }
             BooleanExpression::And(box lhs, box rhs) => {
-                let x = self.flatten_boolean_expression(symbols, statements_flattened, lhs);
-                let y = self.flatten_boolean_expression(symbols, statements_flattened, rhs);
+                let x = self.flatten_boolean_expression(statements_flattened, lhs);
+                let y = self.flatten_boolean_expression(statements_flattened, rhs);
 
                 let name_x_and_y = self.use_sym();
                 assert!(x.is_linear() && y.is_linear());
@@ -718,7 +1064,7 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                 FlatExpression::Identifier(name_x_and_y)
             }
             BooleanExpression::Not(box exp) => {
-                let x = self.flatten_boolean_expression(symbols, statements_flattened, exp);
+                let x = self.flatten_boolean_expression(statements_flattened, exp);
                 FlatExpression::Sub(box FlatExpression::Number(T::one()), box x)
             }
             BooleanExpression::Value(b) => FlatExpression::Number(match b {
@@ -727,38 +1073,32 @@ impl<'ast, T: Field> Flattener<'ast, T> {
             }),
             BooleanExpression::IfElse(box condition, box consequence, box alternative) => self
                 .flatten_if_else_expression(
-                    symbols,
                     statements_flattened,
                     condition,
                     consequence,
                     alternative,
                 )
-                .get_field_unchecked()
-                .clone(),
+                .get_field_unchecked(),
         }
     }
 
     fn flatten_u_to_bits(
         &mut self,
-        symbols: &ZirFunctionSymbols<'ast, T>,
         statements_flattened: &mut FlatStatements<T>,
         expression: ZirExpression<'ast, T>,
         bitwidth: UBitwidth,
     ) -> Vec<FlatUExpression<T>> {
         let expression = UExpression::try_from(expression).unwrap();
-        let from = expression.metadata.clone().unwrap().bitwidth();
-        let p = self.flatten_uint_expression(symbols, statements_flattened, expression);
-        let bits = self
-            .get_bits(p, from as usize, bitwidth, statements_flattened)
+        let from = expression.metadata.as_ref().unwrap().bitwidth();
+        let p = self.flatten_uint_expression(statements_flattened, expression);
+        self.get_bits(&p, from as usize, bitwidth, statements_flattened)
             .into_iter()
-            .map(|b| FlatUExpression::with_field(b))
-            .collect();
-        bits
+            .map(FlatUExpression::with_field)
+            .collect()
     }
 
     fn flatten_bits_to_u(
         &mut self,
-        symbols: &ZirFunctionSymbols<'ast, T>,
         statements_flattened: &mut FlatStatements<T>,
         bits: Vec<ZirExpression<'ast, T>>,
         bitwidth: UBitwidth,
@@ -767,7 +1107,7 @@ impl<'ast, T: Field> Flattener<'ast, T> {
         let bits: Vec<_> = bits
             .into_iter()
             .map(|p| {
-                self.flatten_expression(symbols, statements_flattened, p)
+                self.flatten_expression(statements_flattened, p)
                     .get_field_unchecked()
             })
             .collect();
@@ -779,76 +1119,115 @@ impl<'ast, T: Field> Flattener<'ast, T> {
     ///
     /// # Arguments
     ///
-    /// * `symbols` - Available functions in this context
     /// * `statements_flattened` - Vector where new flattened statements can be added.
     /// * `id` - `Identifier of the function.
     /// * `return_types` - Types of the return values of the function
     /// * `param_expressions` - Arguments of this call
-    fn flatten_function_call(
+    fn flatten_embed_call(
         &mut self,
-        symbols: &ZirFunctionSymbols<'ast, T>,
         statements_flattened: &mut FlatStatements<T>,
-        id: FunctionIdentifier<'ast>,
-        return_types: Vec<Type>,
-        param_expressions: Vec<ZirExpression<'ast, T>>,
+        embed: FlatEmbed,
+        generics: Vec<u32>,
+        mut param_expressions: Vec<ZirExpression<'ast, T>>,
     ) -> Vec<FlatUExpression<T>> {
-        let passed_signature = Signature::new()
-            .inputs(param_expressions.iter().map(|e| e.get_type()).collect())
-            .outputs(return_types);
-
-        let key = FunctionKey::with_id(id).signature(passed_signature);
-
-        let funct = self.get_embed(&key, &symbols);
-
-        match funct {
-            crate::embed::FlatEmbed::U32ToBits => self.flatten_u_to_bits(
-                symbols,
+        match embed {
+            crate::embed::FlatEmbed::U64ToBits => self.flatten_u_to_bits(
                 statements_flattened,
-                param_expressions[0].clone(),
+                param_expressions.pop().unwrap(),
+                64.into(),
+            ),
+            crate::embed::FlatEmbed::U32ToBits => self.flatten_u_to_bits(
+                statements_flattened,
+                param_expressions.pop().unwrap(),
                 32.into(),
             ),
             crate::embed::FlatEmbed::U16ToBits => self.flatten_u_to_bits(
-                symbols,
                 statements_flattened,
-                param_expressions[0].clone(),
+                param_expressions.pop().unwrap(),
                 16.into(),
             ),
             crate::embed::FlatEmbed::U8ToBits => self.flatten_u_to_bits(
-                symbols,
                 statements_flattened,
-                param_expressions[0].clone(),
+                param_expressions.pop().unwrap(),
                 8.into(),
             ),
-            crate::embed::FlatEmbed::U32FromBits => vec![self.flatten_bits_to_u(
-                symbols,
-                statements_flattened,
-                param_expressions,
-                32.into(),
-            )],
-            crate::embed::FlatEmbed::U16FromBits => vec![self.flatten_bits_to_u(
-                symbols,
-                statements_flattened,
-                param_expressions,
-                16.into(),
-            )],
-            crate::embed::FlatEmbed::U8FromBits => vec![self.flatten_bits_to_u(
-                symbols,
-                statements_flattened,
-                param_expressions,
-                8.into(),
-            )],
+            crate::embed::FlatEmbed::U64FromBits => {
+                vec![self.flatten_bits_to_u(statements_flattened, param_expressions, 64.into())]
+            }
+            crate::embed::FlatEmbed::U32FromBits => {
+                vec![self.flatten_bits_to_u(statements_flattened, param_expressions, 32.into())]
+            }
+            crate::embed::FlatEmbed::U16FromBits => {
+                vec![self.flatten_bits_to_u(statements_flattened, param_expressions, 16.into())]
+            }
+            crate::embed::FlatEmbed::U8FromBits => {
+                vec![self.flatten_bits_to_u(statements_flattened, param_expressions, 8.into())]
+            }
+            crate::embed::FlatEmbed::BitArrayLe => {
+                // get the length of the bit arrays
+                let len = generics[0];
+
+                // split the arguments into the two bit arrays of size `len`
+                let (expressions, constants) = (
+                    param_expressions[..len as usize].to_vec(),
+                    param_expressions[len as usize..].to_vec(),
+                );
+
+                // define variables for the variable bits
+                let variables: Vec<_> = expressions
+                    .into_iter()
+                    .map(|e| {
+                        let e = self
+                            .flatten_expression(statements_flattened, e)
+                            .get_field_unchecked();
+                        self.define(e, statements_flattened)
+                    })
+                    .collect();
+
+                // get constants for the constant bits
+                let constants: Vec<_> = constants
+                    .into_iter()
+                    .map(|e| {
+                        self.flatten_expression(statements_flattened, e)
+                            .get_field_unchecked()
+                    })
+                    .map(|e| match e {
+                        FlatExpression::Number(n) if n == T::one() => true,
+                        FlatExpression::Number(n) if n == T::zero() => false,
+                        _ => unreachable!(),
+                    })
+                    .collect();
+
+                // get the list of conditions which must hold iff the `<=` relation holds
+                let conditions =
+                    self.constant_le_check(statements_flattened, &variables, &constants);
+
+                // return `len(conditions) == sum(conditions)`
+                vec![FlatUExpression::with_field(
+                    self.eq_check(
+                        statements_flattened,
+                        T::from(conditions.len()).into(),
+                        conditions
+                            .into_iter()
+                            .fold(FlatExpression::Number(T::zero()), |acc, e| {
+                                FlatExpression::Add(box acc, box e)
+                            }),
+                    ),
+                )]
+            }
             funct => {
-                let funct = funct.synthetize();
+                let funct = funct.synthetize(&generics);
 
                 let mut replacement_map = HashMap::new();
 
                 // Handle complex parameters and assign values:
                 // Rename Parameters, assign them to values in call. Resolve complex expressions with definitions
+                // Clippy doesn't like the fact that we're collecting here, however not doing so leads to a borrow issue
+                // of `self` in the for-loop just after. This is why the `needless_collect` lint is disabled for this file
+                // (it does not work for this single line)
                 let params_flattened = param_expressions
                     .into_iter()
-                    .map(|param_expr| {
-                        self.flatten_expression(symbols, statements_flattened, param_expr)
-                    })
+                    .map(|param_expr| self.flatten_expression(statements_flattened, param_expr))
                     .into_iter()
                     .map(|x| x.get_field_unchecked())
                     .collect::<Vec<_>>();
@@ -863,11 +1242,10 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                 // Ensure renaming and correct returns:
                 // add all flattened statements, adapt return statements
 
-                let (mut return_statements, statements): (Vec<_>, Vec<_>) =
-                    funct.statements.into_iter().partition(|s| match s {
-                        FlatStatement::Return(..) => true,
-                        _ => false,
-                    });
+                let (mut return_statements, statements): (Vec<_>, Vec<_>) = funct
+                    .statements
+                    .into_iter()
+                    .partition(|s| matches!(s, FlatStatement::Return(..)));
 
                 let statements: Vec<_> = statements
                     .into_iter()
@@ -880,10 +1258,10 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                             let new_rhs = rhs.apply_substitution(&replacement_map);
                             FlatStatement::Definition(new_var, new_rhs)
                         }
-                        FlatStatement::Condition(lhs, rhs) => {
+                        FlatStatement::Condition(lhs, rhs, message) => {
                             let new_lhs = lhs.apply_substitution(&replacement_map);
                             let new_rhs = rhs.apply_substitution(&replacement_map);
-                            FlatStatement::Condition(new_lhs, new_rhs)
+                            FlatStatement::Condition(new_lhs, new_rhs, message)
                         }
                         FlatStatement::Directive(d) => {
                             let new_outputs = d
@@ -916,7 +1294,7 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                         .expressions
                         .into_iter()
                         .map(|x| x.apply_substitution(&replacement_map))
-                        .map(|x| FlatUExpression::with_field(x))
+                        .map(FlatUExpression::with_field)
                         .collect(),
                     _ => unreachable!(),
                 }
@@ -928,37 +1306,32 @@ impl<'ast, T: Field> Flattener<'ast, T> {
     ///
     /// # Arguments
     ///
-    /// * `symbols` - Available functions in this context
     /// * `statements_flattened` - Vector where new flattened statements can be added.
     /// * `expr` - `ZirExpression` that will be flattened.
     fn flatten_expression(
         &mut self,
-        symbols: &ZirFunctionSymbols<'ast, T>,
         statements_flattened: &mut FlatStatements<T>,
         expr: ZirExpression<'ast, T>,
     ) -> FlatUExpression<T> {
         match expr {
-            ZirExpression::FieldElement(e) => FlatUExpression::with_field(
-                self.flatten_field_expression(symbols, statements_flattened, e),
-            ),
-            ZirExpression::Boolean(e) => FlatUExpression::with_field(
-                self.flatten_boolean_expression(symbols, statements_flattened, e),
-            ),
-            ZirExpression::Uint(e) => {
-                self.flatten_uint_expression(symbols, statements_flattened, e)
+            ZirExpression::FieldElement(e) => {
+                FlatUExpression::with_field(self.flatten_field_expression(statements_flattened, e))
             }
+            ZirExpression::Boolean(e) => FlatUExpression::with_field(
+                self.flatten_boolean_expression(statements_flattened, e),
+            ),
+            ZirExpression::Uint(e) => self.flatten_uint_expression(statements_flattened, e),
         }
     }
 
     fn default_xor(
         &mut self,
-        symbols: &ZirFunctionSymbols<'ast, T>,
         statements_flattened: &mut FlatStatements<T>,
         left: UExpression<'ast, T>,
         right: UExpression<'ast, T>,
     ) -> FlatUExpression<T> {
-        let left_flattened = self.flatten_uint_expression(symbols, statements_flattened, left);
-        let right_flattened = self.flatten_uint_expression(symbols, statements_flattened, right);
+        let left_flattened = self.flatten_uint_expression(statements_flattened, left);
+        let right_flattened = self.flatten_uint_expression(statements_flattened, right);
 
         // `left` and `right` were reduced to the target bitwidth, hence their bits are available
 
@@ -974,10 +1347,7 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                         self.define(e, statements_flattened).into()
                     } else if n == T::from(1) {
                         self.define(
-                            FlatExpression::Sub(
-                                box FlatExpression::Number(T::from(1)),
-                                box e.clone(),
-                            ),
+                            FlatExpression::Sub(box FlatExpression::Number(T::from(1)), box e),
                             statements_flattened,
                         )
                         .into()
@@ -990,19 +1360,20 @@ impl<'ast, T: Field> Flattener<'ast, T> {
 
                     statements_flattened.extend(vec![
                         FlatStatement::Directive(FlatDirective::new(
-                            vec![name.clone()],
+                            vec![name],
                             Solver::Xor,
                             vec![x.clone(), y.clone()],
                         )),
                         FlatStatement::Condition(
                             FlatExpression::Add(
                                 box x.clone(),
-                                box FlatExpression::Sub(box y.clone(), box name.clone().into()),
+                                box FlatExpression::Sub(box y.clone(), box name.into()),
                             ),
                             FlatExpression::Mult(
-                                box FlatExpression::Add(box x.clone(), box x.clone()),
-                                box y.clone(),
+                                box FlatExpression::Add(box x.clone(), box x),
+                                box y,
                             ),
+                            RuntimeError::Xor,
                         ),
                     ]);
 
@@ -1016,17 +1387,16 @@ impl<'ast, T: Field> Flattener<'ast, T> {
 
     fn euclidean_division(
         &mut self,
-        symbols: &ZirFunctionSymbols<'ast, T>,
         statements_flattened: &mut FlatStatements<T>,
         target_bitwidth: UBitwidth,
         left: UExpression<'ast, T>,
         right: UExpression<'ast, T>,
     ) -> (FlatExpression<T>, FlatExpression<T>) {
         let left_flattened = self
-            .flatten_uint_expression(symbols, statements_flattened, left)
+            .flatten_uint_expression(statements_flattened, left)
             .get_field_unchecked();
         let right_flattened = self
-            .flatten_uint_expression(symbols, statements_flattened, right)
+            .flatten_uint_expression(statements_flattened, right)
             .get_field_unchecked();
         let n = if left_flattened.is_linear() {
             left_flattened
@@ -1056,7 +1426,8 @@ impl<'ast, T: Field> Flattener<'ast, T> {
         // assert(invd * d == 1)
         statements_flattened.push(FlatStatement::Condition(
             FlatExpression::Number(T::one()),
-            FlatExpression::Mult(box invd.into(), box d.clone().into()),
+            FlatExpression::Mult(box invd.into(), box d.clone()),
+            RuntimeError::Inverse,
         ));
 
         // now introduce the quotient and remainder
@@ -1065,13 +1436,13 @@ impl<'ast, T: Field> Flattener<'ast, T> {
 
         statements_flattened.push(FlatStatement::Directive(FlatDirective {
             inputs: vec![n.clone(), d.clone()],
-            outputs: vec![q.clone(), r.clone()],
+            outputs: vec![q, r],
             solver: Solver::EuclideanDiv,
         }));
 
         // q in range
         let _ = self.get_bits(
-            FlatUExpression::with_field(FlatExpression::from(q)),
+            &FlatUExpression::with_field(FlatExpression::from(q)),
             target_bitwidth.to_usize(),
             target_bitwidth,
             statements_flattened,
@@ -1079,7 +1450,7 @@ impl<'ast, T: Field> Flattener<'ast, T> {
 
         // r in range
         let _ = self.get_bits(
-            FlatUExpression::with_field(FlatExpression::from(r)),
+            &FlatUExpression::with_field(FlatExpression::from(r)),
             target_bitwidth.to_usize(),
             target_bitwidth,
             statements_flattened,
@@ -1087,9 +1458,9 @@ impl<'ast, T: Field> Flattener<'ast, T> {
 
         // r < d <=> r - d + 2**w < 2**w
         let _ = self.get_bits(
-            FlatUExpression::with_field(FlatExpression::Add(
-                box FlatExpression::Sub(box r.into(), box d.clone().into()),
-                box FlatExpression::Number(T::from(2usize.pow(target_bitwidth.to_usize() as u32))),
+            &FlatUExpression::with_field(FlatExpression::Add(
+                box FlatExpression::Sub(box r.into(), box d.clone()),
+                box FlatExpression::Number(T::from(2_u128.pow(target_bitwidth.to_usize() as u32))),
             )),
             target_bitwidth.to_usize(),
             target_bitwidth,
@@ -1100,6 +1471,7 @@ impl<'ast, T: Field> Flattener<'ast, T> {
         statements_flattened.push(FlatStatement::Condition(
             FlatExpression::Sub(box n, box r.into()),
             FlatExpression::Mult(box q.into(), box d),
+            RuntimeError::Euclidean,
         ));
 
         (q.into(), r.into())
@@ -1109,19 +1481,17 @@ impl<'ast, T: Field> Flattener<'ast, T> {
     ///
     /// # Arguments
     ///
-    /// * `symbols` - Available functions in this context
     /// * `statements_flattened` - Vector where new flattened statements can be added.
     /// * `expr` - `UExpression` that will be flattened.
     fn flatten_uint_expression(
         &mut self,
-        symbols: &ZirFunctionSymbols<'ast, T>,
         statements_flattened: &mut FlatStatements<T>,
         expr: UExpression<'ast, T>,
     ) -> FlatUExpression<T> {
         // the bitwidth for this type of uint (8, 16 or 32)
         let target_bitwidth = expr.bitwidth;
 
-        let metadata = expr.metadata.clone().unwrap().clone();
+        let metadata = expr.metadata.clone().unwrap();
 
         // the bitwidth on which this value is currently represented
         let actual_bitwidth = metadata.bitwidth() as usize;
@@ -1136,15 +1506,18 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                 FlatUExpression::with_field(FlatExpression::Number(T::from(x as usize)))
             } // force to be a field element
             UExpressionInner::Identifier(x) => {
-                let field = FlatExpression::Identifier(self.layout.get(&x).unwrap().clone());
+                let field = FlatExpression::Identifier(*self.layout.get(&x).unwrap());
                 let bits = self.bits_cache.get(&field).map(|bits| {
                     assert_eq!(bits.len(), target_bitwidth.to_usize());
                     bits.clone()
                 });
                 FlatUExpression::with_field(field).bits(bits)
             }
+            UExpressionInner::Select(a, box index) => {
+                self.flatten_select_expression(statements_flattened, a, index)
+            }
             UExpressionInner::Not(box e) => {
-                let e = self.flatten_uint_expression(symbols, statements_flattened, e);
+                let e = self.flatten_uint_expression(statements_flattened, e);
 
                 let e_bits = e.bits.unwrap();
 
@@ -1165,11 +1538,11 @@ impl<'ast, T: Field> Flattener<'ast, T> {
             }
             UExpressionInner::Add(box left, box right) => {
                 let left_flattened = self
-                    .flatten_uint_expression(symbols, statements_flattened, left)
+                    .flatten_uint_expression(statements_flattened, left)
                     .get_field_unchecked();
 
                 let right_flattened = self
-                    .flatten_uint_expression(symbols, statements_flattened, right)
+                    .flatten_uint_expression(statements_flattened, right)
                     .get_field_unchecked();
 
                 let new_left = if left_flattened.is_linear() {
@@ -1191,15 +1564,16 @@ impl<'ast, T: Field> Flattener<'ast, T> {
             }
             UExpressionInner::Sub(box left, box right) => {
                 // see uint optimizer for the reasoning here
-                let aux = FlatExpression::Number(
-                    T::from(2).pow(right.metadata.clone().unwrap().bitwidth() as usize),
-                );
+                let offset = FlatExpression::Number(T::from(2).pow(std::cmp::max(
+                    right.metadata.as_ref().unwrap().bitwidth() as usize,
+                    target_bitwidth as usize,
+                )));
 
                 let left_flattened = self
-                    .flatten_uint_expression(symbols, statements_flattened, left)
+                    .flatten_uint_expression(statements_flattened, left)
                     .get_field_unchecked();
                 let right_flattened = self
-                    .flatten_uint_expression(symbols, statements_flattened, right)
+                    .flatten_uint_expression(statements_flattened, right)
                     .get_field_unchecked();
                 let new_left = if left_flattened.is_linear() {
                     left_flattened
@@ -1217,19 +1591,12 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                 };
 
                 FlatUExpression::with_field(FlatExpression::Add(
-                    box aux,
+                    box offset,
                     box FlatExpression::Sub(box new_left, box new_right),
                 ))
             }
-            UExpressionInner::LeftShift(box e, box by) => {
-                let e = self.flatten_uint_expression(symbols, statements_flattened, e);
-
-                let by = match by {
-                    FieldElementExpression::Number(n) => {
-                        n.to_dec_string().parse::<usize>().unwrap()
-                    }
-                    _ => unreachable!(),
-                };
+            UExpressionInner::LeftShift(box e, by) => {
+                let e = self.flatten_uint_expression(statements_flattened, e);
 
                 let e_bits = e.bits.unwrap();
 
@@ -1238,44 +1605,37 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                 FlatUExpression::with_bits(
                     e_bits
                         .into_iter()
-                        .skip(by)
+                        .skip(by as usize)
                         .chain(
-                            (0..std::cmp::min(by, target_bitwidth.to_usize()))
+                            (0..std::cmp::min(by as usize, target_bitwidth.to_usize()))
                                 .map(|_| FlatExpression::Number(T::from(0))),
                         )
                         .collect::<Vec<_>>(),
                 )
             }
-            UExpressionInner::RightShift(box e, box by) => {
-                let e = self.flatten_uint_expression(symbols, statements_flattened, e);
-
-                let by = match by {
-                    FieldElementExpression::Number(n) => {
-                        n.to_dec_string().parse::<usize>().unwrap()
-                    }
-                    _ => unreachable!(),
-                };
+            UExpressionInner::RightShift(box e, by) => {
+                let e = self.flatten_uint_expression(statements_flattened, e);
 
                 let e_bits = e.bits.unwrap();
 
                 assert_eq!(e_bits.len(), target_bitwidth.to_usize());
 
                 FlatUExpression::with_bits(
-                    (0..std::cmp::min(by, target_bitwidth.to_usize()))
+                    (0..std::cmp::min(by as usize, target_bitwidth.to_usize()))
                         .map(|_| FlatExpression::Number(T::from(0)))
                         .chain(e_bits.into_iter().take(
                             target_bitwidth.to_usize()
-                                - std::cmp::min(by, target_bitwidth.to_usize()),
+                                - std::cmp::min(by as usize, target_bitwidth.to_usize()),
                         ))
                         .collect::<Vec<_>>(),
                 )
             }
             UExpressionInner::Mult(box left, box right) => {
                 let left_flattened = self
-                    .flatten_uint_expression(symbols, statements_flattened, left)
+                    .flatten_uint_expression(statements_flattened, left)
                     .get_field_unchecked();
                 let right_flattened = self
-                    .flatten_uint_expression(symbols, statements_flattened, right)
+                    .flatten_uint_expression(statements_flattened, right)
                     .get_field_unchecked();
                 let new_left = if left_flattened.is_linear() {
                     left_flattened
@@ -1302,36 +1662,24 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                 FlatUExpression::with_field(FlatExpression::Identifier(res))
             }
             UExpressionInner::Div(box left, box right) => {
-                let (q, _) = self.euclidean_division(
-                    symbols,
-                    statements_flattened,
-                    target_bitwidth,
-                    left,
-                    right,
-                );
+                let (q, _) =
+                    self.euclidean_division(statements_flattened, target_bitwidth, left, right);
 
                 FlatUExpression::with_field(q)
             }
             UExpressionInner::Rem(box left, box right) => {
-                let (_, r) = self.euclidean_division(
-                    symbols,
-                    statements_flattened,
-                    target_bitwidth,
-                    left,
-                    right,
-                );
+                let (_, r) =
+                    self.euclidean_division(statements_flattened, target_bitwidth, left, right);
 
                 FlatUExpression::with_field(r)
             }
             UExpressionInner::IfElse(box condition, box consequence, box alternative) => self
                 .flatten_if_else_expression(
-                    symbols,
                     statements_flattened,
                     condition,
                     consequence,
                     alternative,
-                )
-                .clone(),
+                ),
             UExpressionInner::Xor(box left, box right) => {
                 let left_metadata = left.metadata.clone().unwrap();
                 let right_metadata = right.metadata.clone().unwrap();
@@ -1339,12 +1687,9 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                 match (left.into_inner(), right.into_inner()) {
                     (UExpressionInner::And(box a, box b), UExpressionInner::And(box aa, box c)) => {
                         if aa.clone().into_inner() == UExpressionInner::Not(box a.clone()) {
-                            let a_flattened =
-                                self.flatten_uint_expression(symbols, statements_flattened, a);
-                            let b_flattened =
-                                self.flatten_uint_expression(symbols, statements_flattened, b);
-                            let c_flattened =
-                                self.flatten_uint_expression(symbols, statements_flattened, c);
+                            let a_flattened = self.flatten_uint_expression(statements_flattened, a);
+                            let b_flattened = self.flatten_uint_expression(statements_flattened, b);
+                            let c_flattened = self.flatten_uint_expression(statements_flattened, c);
 
                             let a_bits = a_flattened.bits.unwrap();
                             let b_bits = b_flattened.bits.unwrap();
@@ -1361,7 +1706,7 @@ impl<'ast, T: Field> Flattener<'ast, T> {
 
                                     statements_flattened.extend(vec![
                                         FlatStatement::Directive(FlatDirective::new(
-                                            vec![ch.clone()],
+                                            vec![ch],
                                             Solver::ShaCh,
                                             vec![a.clone(), b.clone(), c.clone()],
                                         )),
@@ -1371,6 +1716,7 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                                                 box a,
                                                 box FlatExpression::Sub(box b, box c),
                                             ),
+                                            RuntimeError::ShaXor,
                                         ),
                                     ]);
                                     ch.into()
@@ -1380,7 +1726,6 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                             FlatUExpression::with_bits(res)
                         } else {
                             self.default_xor(
-                                symbols,
                                 statements_flattened,
                                 UExpressionInner::And(box a, box b)
                                     .annotate(target_bitwidth)
@@ -1402,21 +1747,12 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                                 UExpressionInner::And(box bb, box cc),
                             ) => {
                                 if (aa == a) && (bb == b) && (cc == c) {
-                                    let a_flattened = self.flatten_uint_expression(
-                                        symbols,
-                                        statements_flattened,
-                                        a,
-                                    );
-                                    let b_flattened = self.flatten_uint_expression(
-                                        symbols,
-                                        statements_flattened,
-                                        b,
-                                    );
-                                    let c_flattened = self.flatten_uint_expression(
-                                        symbols,
-                                        statements_flattened,
-                                        c,
-                                    );
+                                    let a_flattened =
+                                        self.flatten_uint_expression(statements_flattened, a);
+                                    let b_flattened =
+                                        self.flatten_uint_expression(statements_flattened, b);
+                                    let c_flattened =
+                                        self.flatten_uint_expression(statements_flattened, c);
 
                                     let a_bits = a_flattened.bits.unwrap();
                                     let b_bits = b_flattened.bits.unwrap();
@@ -1435,32 +1771,34 @@ impl<'ast, T: Field> Flattener<'ast, T> {
 
                                             statements_flattened.extend(vec![
                                                 FlatStatement::Directive(FlatDirective::new(
-                                                    vec![maj.clone()],
+                                                    vec![maj],
                                                     Solver::ShaAndXorAndXorAnd,
                                                     vec![a.clone(), b.clone(), c.clone()],
                                                 )),
                                                 FlatStatement::Condition(
-                                                    bc.clone().into(),
+                                                    bc.into(),
                                                     FlatExpression::Mult(
                                                         box b.clone(),
                                                         box c.clone(),
                                                     ),
+                                                    RuntimeError::ShaXor,
                                                 ),
                                                 FlatStatement::Condition(
                                                     FlatExpression::Sub(
-                                                        box bc.clone().into(),
+                                                        box bc.into(),
                                                         box maj.into(),
                                                     ),
                                                     FlatExpression::Mult(
                                                         box FlatExpression::Sub(
                                                             box FlatExpression::Add(
-                                                                box bc.clone().into(),
-                                                                box bc.clone().into(),
+                                                                box bc.into(),
+                                                                box bc.into(),
                                                             ),
                                                             box FlatExpression::Add(box b, box c),
                                                         ),
                                                         box a,
                                                     ),
+                                                    RuntimeError::ShaXor,
                                                 ),
                                             ]);
                                             maj.into()
@@ -1470,7 +1808,6 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                                     FlatUExpression::with_bits(res)
                                 } else {
                                     self.default_xor(
-                                        symbols,
                                         statements_flattened,
                                         UExpressionInner::Xor(
                                             box UExpressionInner::And(box a, box b)
@@ -1489,7 +1826,6 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                                 }
                             }
                             (a, b, c) => self.default_xor(
-                                symbols,
                                 statements_flattened,
                                 UExpressionInner::Xor(
                                     box a.annotate(target_bitwidth).metadata(a_metadata),
@@ -1502,7 +1838,6 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                         }
                     }
                     (left_i, right_i) => self.default_xor(
-                        symbols,
                         statements_flattened,
                         left_i.annotate(target_bitwidth).metadata(left_metadata),
                         right_i.annotate(target_bitwidth).metadata(right_metadata),
@@ -1510,11 +1845,9 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                 }
             }
             UExpressionInner::And(box left, box right) => {
-                let left_flattened =
-                    self.flatten_uint_expression(symbols, statements_flattened, left);
+                let left_flattened = self.flatten_uint_expression(statements_flattened, left);
 
-                let right_flattened =
-                    self.flatten_uint_expression(symbols, statements_flattened, right);
+                let right_flattened = self.flatten_uint_expression(statements_flattened, right);
 
                 let left_bits = left_flattened.bits.unwrap();
                 let right_bits = right_flattened.bits.unwrap();
@@ -1536,10 +1869,7 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                             }
                         }
                         (x, y) => self
-                            .define(
-                                FlatExpression::Mult(box x.clone(), box y.clone()),
-                                statements_flattened,
-                            )
+                            .define(FlatExpression::Mult(box x, box y), statements_flattened)
                             .into(),
                     })
                     .collect();
@@ -1547,10 +1877,8 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                 FlatUExpression::with_bits(and)
             }
             UExpressionInner::Or(box left, box right) => {
-                let left_flattened =
-                    self.flatten_uint_expression(symbols, statements_flattened, left);
-                let right_flattened =
-                    self.flatten_uint_expression(symbols, statements_flattened, right);
+                let left_flattened = self.flatten_uint_expression(statements_flattened, left);
+                let right_flattened = self.flatten_uint_expression(statements_flattened, right);
 
                 let left_bits = left_flattened.bits.unwrap();
                 let right_bits = right_flattened.bits.unwrap();
@@ -1579,19 +1907,17 @@ impl<'ast, T: Field> Flattener<'ast, T> {
 
                             statements_flattened.extend(vec![
                                 FlatStatement::Directive(FlatDirective::new(
-                                    vec![name.clone()],
+                                    vec![name],
                                     Solver::Or,
                                     vec![x.clone(), y.clone()],
                                 )),
                                 FlatStatement::Condition(
                                     FlatExpression::Add(
                                         box x.clone(),
-                                        box FlatExpression::Sub(
-                                            box y.clone(),
-                                            box name.clone().into(),
-                                        ),
+                                        box FlatExpression::Sub(box y.clone(), box name.into()),
                                     ),
                                     FlatExpression::Mult(box x, box y),
+                                    RuntimeError::Or,
                                 ),
                             ]);
                             name.into()
@@ -1605,12 +1931,8 @@ impl<'ast, T: Field> Flattener<'ast, T> {
 
         let res = match should_reduce {
             true => {
-                let bits = self.get_bits(
-                    res.clone(),
-                    actual_bitwidth,
-                    target_bitwidth,
-                    statements_flattened,
-                );
+                let bits =
+                    self.get_bits(&res, actual_bitwidth, target_bitwidth, statements_flattened);
 
                 let field = if actual_bitwidth > target_bitwidth.to_usize() {
                     bits.iter().enumerate().fold(
@@ -1622,7 +1944,7 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                                     box FlatExpression::Number(
                                         T::from(2).pow(target_bitwidth.to_usize() - index - 1),
                                     ),
-                                    box bit.clone().into(),
+                                    box bit.clone(),
                                 ),
                             )
                         },
@@ -1641,7 +1963,7 @@ impl<'ast, T: Field> Flattener<'ast, T> {
 
     fn get_bits(
         &mut self,
-        e: FlatUExpression<T>,
+        e: &FlatUExpression<T>,
         from: usize,
         to: UBitwidth,
         statements_flattened: &mut FlatStatements<T>,
@@ -1652,23 +1974,18 @@ impl<'ast, T: Field> Flattener<'ast, T> {
         assert!(to < T::get_required_bits());
 
         // constants do not require directives
-        match e.field {
-            Some(FlatExpression::Number(ref x)) => {
-                let solver = Solver::bits(to);
-                let bits: Vec<_> = solver
-                    .execute(&vec![x.clone()])
-                    .unwrap()
-                    .into_iter()
-                    .map(|x| FlatExpression::Number(x))
-                    .collect();
+        if let Some(FlatExpression::Number(ref x)) = e.field {
+            let bits: Vec<_> = Interpreter::execute_solver(&Solver::bits(to), &[x.clone()])
+                .unwrap()
+                .into_iter()
+                .map(FlatExpression::Number)
+                .collect();
 
-                assert_eq!(bits.len(), to);
+            assert_eq!(bits.len(), to);
 
-                self.bits_cache
-                    .insert(e.field.clone().unwrap(), bits.clone());
-                return bits;
-            }
-            _ => {}
+            self.bits_cache
+                .insert(e.field.clone().unwrap(), bits.clone());
+            return bits;
         };
 
         e.bits.clone().unwrap_or_else(|| {
@@ -1679,7 +1996,7 @@ impl<'ast, T: Field> Flattener<'ast, T> {
             let from = std::cmp::max(from, to);
             match self.bits_cache.entry(e.field.clone().unwrap()) {
                 Entry::Occupied(entry) => {
-                    let res: Vec<_> = entry.get().clone().into_iter().map(|e| e.into()).collect();
+                    let res: Vec<_> = entry.get().clone();
                     // if we already know a decomposition, it has to be of the size of the target bitwidth
                     assert_eq!(res.len(), to);
                     res
@@ -1692,21 +2009,16 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                         vec![e.field.clone().unwrap()],
                     )));
 
-                    let bits: Vec<_> = bits
-                        .into_iter()
-                        .map(|b| FlatExpression::Identifier(b))
-                        .collect();
+                    let bits: Vec<_> = bits.into_iter().map(FlatExpression::Identifier).collect();
 
                     // decompose to the actual bitwidth
 
                     // bit checks
-                    statements_flattened.extend((0..from).map(|i| {
+                    statements_flattened.extend(bits.iter().take(from).map(|bit| {
                         FlatStatement::Condition(
-                            bits[i].clone(),
-                            FlatExpression::Mult(
-                                box bits[i].clone().into(),
-                                box bits[i].clone().into(),
-                            ),
+                            bit.clone(),
+                            FlatExpression::Mult(box bit.clone(), box bit.clone()),
+                            RuntimeError::Bitness,
                         )
                     }));
 
@@ -1716,6 +2028,7 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                     statements_flattened.push(FlatStatement::Condition(
                         e.field.clone().unwrap(),
                         sum.clone(),
+                        RuntimeError::Sum,
                     ));
 
                     // truncate to the `to` lowest bits
@@ -1723,38 +2036,94 @@ impl<'ast, T: Field> Flattener<'ast, T> {
 
                     assert_eq!(bits.len(), to);
 
-                    self.bits_cache.insert(e.field.unwrap(), bits.clone());
+                    self.bits_cache
+                        .insert(e.field.clone().unwrap(), bits.clone());
                     self.bits_cache.insert(sum, bits.clone());
 
-                    bits.into_iter().map(|v| v.into()).collect()
+                    bits
                 }
             }
         })
+    }
+
+    fn flatten_select_expression<U: Flatten<'ast, T>>(
+        &mut self,
+        statements_flattened: &mut FlatStatements<T>,
+        a: Vec<U>,
+        index: UExpression<'ast, T>,
+    ) -> FlatUExpression<T> {
+        let (range_check, result) = a
+            .into_iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let condition = self.flatten_boolean_expression(
+                    statements_flattened,
+                    BooleanExpression::UintEq(
+                        box UExpressionInner::Value(i as u128)
+                            .annotate(UBitwidth::B32)
+                            .metadata(UMetadata {
+                                should_reduce: ShouldReduce::True,
+                                max: T::from(i),
+                            }),
+                        box index.clone(),
+                    ),
+                );
+
+                let element = e.flatten(self, statements_flattened);
+
+                (condition, element)
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .fold(
+                (
+                    FlatExpression::Number(T::zero()),
+                    FlatExpression::Number(T::zero()),
+                ),
+                |(mut range_check, mut result), (condition, element)| {
+                    range_check = FlatExpression::Add(box range_check, box condition.clone());
+
+                    let conditional_element_id = self.use_sym();
+                    statements_flattened.push(FlatStatement::Definition(
+                        conditional_element_id,
+                        FlatExpression::Mult(box condition, box element.flat()),
+                    ));
+
+                    result = FlatExpression::Add(box result, box conditional_element_id.into());
+                    (range_check, result)
+                },
+            );
+
+        statements_flattened.push(FlatStatement::Condition(
+            range_check,
+            FlatExpression::Number(T::one()),
+            RuntimeError::SelectRangeCheck,
+        ));
+        FlatUExpression::with_field(result)
     }
 
     /// Flattens a field expression
     ///
     /// # Arguments
     ///
-    /// * `symbols` - Available functions in this context
     /// * `statements_flattened` - Vector where new flattened statements can be added.
     /// * `expr` - `FieldElementExpression` that will be flattened.
     fn flatten_field_expression(
         &mut self,
-        symbols: &ZirFunctionSymbols<'ast, T>,
         statements_flattened: &mut FlatStatements<T>,
         expr: FieldElementExpression<'ast, T>,
     ) -> FlatExpression<T> {
         match expr {
             FieldElementExpression::Number(x) => FlatExpression::Number(x), // force to be a field element
             FieldElementExpression::Identifier(x) => {
-                FlatExpression::Identifier(self.layout.get(&x).unwrap().clone())
+                FlatExpression::Identifier(*self.layout.get(&x).unwrap_or_else(|| panic!("{}", x)))
             }
+            FieldElementExpression::Select(a, box index) => self
+                .flatten_select_expression(statements_flattened, a, index)
+                .get_field_unchecked(),
             FieldElementExpression::Add(box left, box right) => {
-                let left_flattened =
-                    self.flatten_field_expression(symbols, statements_flattened, left);
-                let right_flattened =
-                    self.flatten_field_expression(symbols, statements_flattened, right);
+                let left_flattened = self.flatten_field_expression(statements_flattened, left);
+                let right_flattened = self.flatten_field_expression(statements_flattened, right);
                 let new_left = if left_flattened.is_linear() {
                     left_flattened
                 } else {
@@ -1772,10 +2141,8 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                 FlatExpression::Add(box new_left, box new_right)
             }
             FieldElementExpression::Sub(box left, box right) => {
-                let left_flattened =
-                    self.flatten_field_expression(symbols, statements_flattened, left);
-                let right_flattened =
-                    self.flatten_field_expression(symbols, statements_flattened, right);
+                let left_flattened = self.flatten_field_expression(statements_flattened, left);
+                let right_flattened = self.flatten_field_expression(statements_flattened, right);
 
                 let new_left = if left_flattened.is_linear() {
                     left_flattened
@@ -1795,10 +2162,8 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                 FlatExpression::Sub(box new_left, box new_right)
             }
             FieldElementExpression::Mult(box left, box right) => {
-                let left_flattened =
-                    self.flatten_field_expression(symbols, statements_flattened, left);
-                let right_flattened =
-                    self.flatten_field_expression(symbols, statements_flattened, right);
+                let left_flattened = self.flatten_field_expression(statements_flattened, left);
+                let right_flattened = self.flatten_field_expression(statements_flattened, right);
                 let new_left = if left_flattened.is_linear() {
                     left_flattened
                 } else {
@@ -1816,10 +2181,8 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                 FlatExpression::Mult(box new_left, box new_right)
             }
             FieldElementExpression::Div(box left, box right) => {
-                let left_flattened =
-                    self.flatten_field_expression(symbols, statements_flattened, left);
-                let right_flattened =
-                    self.flatten_field_expression(symbols, statements_flattened, right);
+                let left_flattened = self.flatten_field_expression(statements_flattened, left);
+                let right_flattened = self.flatten_field_expression(statements_flattened, right);
                 let new_left: FlatExpression<T> = {
                     let id = self.use_sym();
                     statements_flattened.push(FlatStatement::Definition(id, left_flattened));
@@ -1844,7 +2207,8 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                 // assert(invb * b == 1)
                 statements_flattened.push(FlatStatement::Condition(
                     FlatExpression::Number(T::one()),
-                    FlatExpression::Mult(box invb.into(), box new_right.clone().into()),
+                    FlatExpression::Mult(box invb.into(), box new_right.clone()),
+                    RuntimeError::Inverse,
                 ));
 
                 // # c = a/b
@@ -1856,27 +2220,23 @@ impl<'ast, T: Field> Flattener<'ast, T> {
 
                 // assert(c * b == a)
                 statements_flattened.push(FlatStatement::Condition(
-                    new_left.into(),
+                    new_left,
                     FlatExpression::Mult(box new_right, box inverse.into()),
+                    RuntimeError::Division,
                 ));
 
                 inverse.into()
             }
             FieldElementExpression::Pow(box base, box exponent) => {
-                match exponent {
-                    FieldElementExpression::Number(ref e) => {
+                match exponent.into_inner() {
+                    UExpressionInner::Value(ref e) => {
                         // flatten the base expression
-                        let base_flattened = self.flatten_field_expression(
-                            symbols,
-                            statements_flattened,
-                            base.clone(),
-                        );
+                        let base_flattened =
+                            self.flatten_field_expression(statements_flattened, base.clone());
 
                         // we require from the base to be linear
                         // TODO change that
                         assert!(base_flattened.is_linear());
-
-                        let e = e.to_dec_string().parse::<usize>().unwrap();
 
                         // convert the exponent to bytes, big endian
                         let ebytes_be = e.to_be_bytes();
@@ -1906,16 +2266,16 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                                         let id = self.use_sym();
                                         // set it to the square of the previous one, stored in state
                                         statements_flattened.push(FlatStatement::Definition(
-                                            id.clone(),
+                                            id,
                                             FlatExpression::Mult(
                                                 box previous.clone(),
                                                 box previous.clone(),
                                             ),
                                         ));
                                         // store it in the state for later squaring
-                                        *state = Some(FlatExpression::Identifier(id.clone()));
+                                        *state = Some(FlatExpression::Identifier(id));
                                         // return it for later use constructing the result
-                                        Some(FlatExpression::Identifier(id.clone()))
+                                        Some(FlatExpression::Identifier(id))
                                     }
                                 }
                             })
@@ -1943,14 +2303,12 @@ impl<'ast, T: Field> Flattener<'ast, T> {
             }
             FieldElementExpression::IfElse(box condition, box consequence, box alternative) => self
                 .flatten_if_else_expression(
-                    symbols,
                     statements_flattened,
                     condition,
                     consequence,
                     alternative,
                 )
-                .get_field_unchecked()
-                .clone(),
+                .get_field_unchecked(),
         }
     }
 
@@ -1958,12 +2316,10 @@ impl<'ast, T: Field> Flattener<'ast, T> {
     ///
     /// # Arguments
     ///
-    /// * `symbols` - Available functions in this context
     /// * `statements_flattened` - Vector where new flattened statements can be added.
     /// * `stat` - `ZirStatement` that will be flattened.
     fn flatten_statement(
         &mut self,
-        symbols: &ZirFunctionSymbols<'ast, T>,
         statements_flattened: &mut FlatStatements<T>,
         stat: ZirStatement<'ast, T>,
     ) {
@@ -1971,7 +2327,7 @@ impl<'ast, T: Field> Flattener<'ast, T> {
             ZirStatement::Return(exprs) => {
                 let flat_expressions = exprs
                     .into_iter()
-                    .map(|expr| self.flatten_expression(symbols, statements_flattened, expr))
+                    .map(|expr| self.flatten_expression(statements_flattened, expr))
                     .map(|x| x.get_field_unchecked())
                     .collect::<Vec<_>>();
 
@@ -1979,15 +2335,52 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                     expressions: flat_expressions,
                 }));
             }
-            ZirStatement::Declaration(_) => {
-                // declarations have already been checked
-                ()
+            ZirStatement::IfElse(condition, consequence, alternative) => {
+                let condition_flat =
+                    self.flatten_boolean_expression(statements_flattened, condition.clone());
+
+                let condition_id = self.use_sym();
+                statements_flattened.push(FlatStatement::Definition(condition_id, condition_flat));
+
+                self.condition_cache.insert(condition, condition_id);
+
+                if self.config.isolate_branches {
+                    let mut consequence_statements = vec![];
+                    let mut alternative_statements = vec![];
+
+                    consequence
+                        .into_iter()
+                        .for_each(|s| self.flatten_statement(&mut consequence_statements, s));
+                    alternative
+                        .into_iter()
+                        .for_each(|s| self.flatten_statement(&mut alternative_statements, s));
+
+                    let consequence_statements =
+                        self.make_conditional(consequence_statements, condition_id.into());
+                    let alternative_statements = self.make_conditional(
+                        alternative_statements,
+                        FlatExpression::Sub(
+                            box FlatExpression::Number(T::one()),
+                            box condition_id.into(),
+                        ),
+                    );
+
+                    statements_flattened.extend(consequence_statements);
+                    statements_flattened.extend(alternative_statements);
+                } else {
+                    consequence
+                        .into_iter()
+                        .for_each(|s| self.flatten_statement(statements_flattened, s));
+                    alternative
+                        .into_iter()
+                        .for_each(|s| self.flatten_statement(statements_flattened, s));
+                }
             }
             ZirStatement::Definition(assignee, expr) => {
                 // define n variables with n the number of primitive types for v_type
                 // assign them to the n primitive types for expr
 
-                let rhs = self.flatten_expression(symbols, statements_flattened, expr);
+                let rhs = self.flatten_expression(statements_flattened, expr);
 
                 let bits = rhs.bits.clone();
 
@@ -2007,12 +2400,9 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                 };
 
                 // register bits
-                match bits {
-                    Some(bits) => {
-                        self.bits_cache
-                            .insert(FlatExpression::Identifier(var), bits);
-                    }
-                    None => {}
+                if let Some(bits) = bits {
+                    self.bits_cache
+                        .insert(FlatExpression::Identifier(var), bits);
                 }
             }
             ZirStatement::Assertion(e) => {
@@ -2020,50 +2410,49 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                     BooleanExpression::And(..) => {
                         for boolean in e.into_conjunction_iterator() {
                             self.flatten_statement(
-                                symbols,
                                 statements_flattened,
                                 ZirStatement::Assertion(boolean),
                             )
                         }
                     }
                     BooleanExpression::FieldEq(box lhs, box rhs) => {
-                        let lhs = self.flatten_field_expression(symbols, statements_flattened, lhs);
-                        let rhs = self.flatten_field_expression(symbols, statements_flattened, rhs);
+                        let lhs = self.flatten_field_expression(statements_flattened, lhs);
+                        let rhs = self.flatten_field_expression(statements_flattened, rhs);
 
-                        self.flatten_equality(statements_flattened, lhs, rhs)
+                        self.flatten_equality_assertion(statements_flattened, lhs, rhs)
                     }
                     BooleanExpression::UintEq(box lhs, box rhs) => {
                         let lhs = self
-                            .flatten_uint_expression(symbols, statements_flattened, lhs)
+                            .flatten_uint_expression(statements_flattened, lhs)
                             .get_field_unchecked();
                         let rhs = self
-                            .flatten_uint_expression(symbols, statements_flattened, rhs)
+                            .flatten_uint_expression(statements_flattened, rhs)
                             .get_field_unchecked();
 
-                        self.flatten_equality(statements_flattened, lhs, rhs)
+                        self.flatten_equality_assertion(statements_flattened, lhs, rhs)
                     }
                     BooleanExpression::BoolEq(box lhs, box rhs) => {
-                        let lhs =
-                            self.flatten_boolean_expression(symbols, statements_flattened, lhs);
-                        let rhs =
-                            self.flatten_boolean_expression(symbols, statements_flattened, rhs);
+                        let lhs = self.flatten_boolean_expression(statements_flattened, lhs);
+                        let rhs = self.flatten_boolean_expression(statements_flattened, rhs);
 
-                        self.flatten_equality(statements_flattened, lhs, rhs)
+                        self.flatten_equality_assertion(statements_flattened, lhs, rhs)
                     }
                     _ => {
                         // naive approach: flatten the boolean to a single field element and constrain it to 1
-                        let e = self.flatten_boolean_expression(symbols, statements_flattened, e);
+                        let e = self.flatten_boolean_expression(statements_flattened, e);
 
                         if e.is_linear() {
                             statements_flattened.push(FlatStatement::Condition(
                                 e,
                                 FlatExpression::Number(T::from(1)),
+                                RuntimeError::Source,
                             ));
                         } else {
                             // swap so that left side is linear
                             statements_flattened.push(FlatStatement::Condition(
                                 FlatExpression::Number(T::from(1)),
                                 e,
+                                RuntimeError::Source,
                             ));
                         }
                     }
@@ -2073,19 +2462,18 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                 // flatten the right side to p = sum(var_i.type.primitive_count) expressions
                 // define p new variables to the right side expressions
 
-                let var_types = vars.iter().map(|v| v.get_type()).collect();
-
                 match rhs {
-                    ZirExpressionList::FunctionCall(key, exprs, _) => {
-                        let rhs_flattened = self.flatten_function_call(
-                            symbols,
+                    ZirExpressionList::EmbedCall(embed, generics, exprs) => {
+                        let rhs_flattened = self.flatten_embed_call(
                             statements_flattened,
-                            &key.id,
-                            var_types,
+                            embed,
+                            generics,
                             exprs.clone(),
                         );
 
                         let rhs = rhs_flattened.into_iter();
+
+                        assert_eq!(vars.len(), rhs.len());
 
                         let vars: Vec<_> = vars
                             .into_iter()
@@ -2103,15 +2491,21 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                             })
                             .collect();
 
-                        if ["_U32_FROM_BITS", "_U16_FROM_BITS", "_U8_FROM_BITS"].contains(&key.id) {
-                            let bits = exprs
-                                .into_iter()
-                                .map(|e| {
-                                    self.flatten_expression(symbols, statements_flattened, e)
-                                        .get_field_unchecked()
-                                })
-                                .collect();
-                            self.bits_cache.insert(vars[0].clone().into(), bits);
+                        match embed {
+                            FlatEmbed::U64FromBits
+                            | FlatEmbed::U32FromBits
+                            | FlatEmbed::U16FromBits
+                            | FlatEmbed::U8FromBits => {
+                                let bits = exprs
+                                    .into_iter()
+                                    .map(|e| {
+                                        self.flatten_expression(statements_flattened, e)
+                                            .get_field_unchecked()
+                                    })
+                                    .collect();
+                                self.bits_cache.insert(vars[0].into(), bits);
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -2122,13 +2516,8 @@ impl<'ast, T: Field> Flattener<'ast, T> {
     /// Flattens a function
     ///
     /// # Arguments
-    /// * `symbols` - Available functions in in this context
     /// * `funct` - `ZirFunction` that will be flattened
-    fn flatten_function(
-        &mut self,
-        symbols: &ZirFunctionSymbols<'ast, T>,
-        funct: ZirFunction<'ast, T>,
-    ) -> FlatFunction<T> {
+    fn flatten_function(&mut self, funct: ZirFunction<'ast, T>) -> FlatFunction<T> {
         self.layout = HashMap::new();
 
         self.next_var_idx = 0;
@@ -2143,7 +2532,7 @@ impl<'ast, T: Field> Flattener<'ast, T> {
 
         // flatten statements in functions and apply substitution
         for stat in funct.statements {
-            self.flatten_statement(symbols, &mut statements_flattened, stat);
+            self.flatten_statement(&mut statements_flattened, stat);
         }
 
         FlatFunction {
@@ -2158,39 +2547,19 @@ impl<'ast, T: Field> Flattener<'ast, T> {
     ///
     /// * `prog` - `ZirProgram` that will be flattened.
     fn flatten_program(&mut self, prog: ZirProgram<'ast, T>) -> FlatProg<T> {
-        let mut prog = prog;
-
-        let mut main_module = prog.modules.remove(&prog.main).unwrap();
-
-        let main_key = main_module
-            .functions
-            .keys()
-            .find(|k| k.id == "main")
-            .unwrap()
-            .clone();
-
-        let main = main_module.functions.remove(&main_key).unwrap();
-
-        let symbols = &main_module.functions;
-
-        let main_flattened = match main {
-            ZirFunctionSymbol::Here(f) => self.flatten_function(&symbols, f),
-            _ => unreachable!("main should be a typed function locally"),
-        };
-
         FlatProg {
-            main: main_flattened,
+            main: self.flatten_function(prog.main),
         }
     }
 
-    /// Flattens an equality expression
+    /// Flattens an equality assertion, enforcing it in the circuit.
     ///
     /// # Arguments
     ///
     /// * `statements_flattened` - `FlatStatements<T>` Vector where new flattened statements can be added.
     /// * `lhs` - `FlatExpression<T>` Left-hand side of the equality expression.
     /// * `rhs` - `FlatExpression<T>` Right-hand side of the equality expression.
-    fn flatten_equality(
+    fn flatten_equality_assertion(
         &mut self,
         statements_flattened: &mut FlatStatements<T>,
         lhs: FlatExpression<T>,
@@ -2212,7 +2581,7 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                 ),
             ),
         };
-        statements_flattened.push(FlatStatement::Condition(lhs, rhs));
+        statements_flattened.push(FlatStatement::Condition(lhs, rhs, RuntimeError::Source));
     }
 
     /// Identifies a non-linear expression by assigning it to a new identifier.
@@ -2243,7 +2612,7 @@ impl<'ast, T: Field> Flattener<'ast, T> {
     fn use_variable(&mut self, variable: &Variable<'ast>) -> FlatVariable {
         let var = self.issue_new_variable();
 
-        self.layout.insert(variable.id.clone(), var.clone());
+        self.layout.insert(variable.id.clone(), var);
         var
     }
 
@@ -2272,7 +2641,7 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                 // to constrain unsigned integer inputs to be in range, we get their bit decomposition.
                 // it will be cached
                 self.get_bits(
-                    FlatUExpression::with_field(FlatExpression::Identifier(variable)),
+                    &FlatUExpression::with_field(FlatExpression::Identifier(variable)),
                     bitwidth.to_usize(),
                     bitwidth,
                     statements_flattened,
@@ -2282,6 +2651,7 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                 statements_flattened.push(FlatStatement::Condition(
                     variable.into(),
                     FlatExpression::Mult(box variable.into(), box variable.into()),
+                    RuntimeError::ArgumentBitness,
                 ));
             }
             Type::FieldElement => {
@@ -2289,8 +2659,8 @@ impl<'ast, T: Field> Flattener<'ast, T> {
                     // we insert dummy condition statement for private field elements
                     // to avoid unconstrained variables
                     // translates to y == x * x
-                    statements_flattened.push(FlatStatement::Condition(
-                        self.use_sym().into(),
+                    statements_flattened.push(FlatStatement::Definition(
+                        self.use_sym(),
                         FlatExpression::Mult(box variable.into(), box variable.into()),
                     ));
                 }
@@ -2312,19 +2682,6 @@ impl<'ast, T: Field> Flattener<'ast, T> {
     // create an internal variable. We do not register it in the layout
     fn use_sym(&mut self) -> FlatVariable {
         self.issue_new_variable()
-    }
-
-    fn get_embed<'a>(
-        &mut self,
-        key: &'a FunctionKey<'ast>,
-        symbols: &'a ZirFunctionSymbols<'ast, T>,
-    ) -> crate::embed::FlatEmbed {
-        let f = symbols.get(&key).expect(&format!("{}", key.id)).clone();
-        let res = match f {
-            ZirFunctionSymbol::Flat(flat_function) => flat_function,
-            _ => unreachable!("only local flat symbols can be flattened"),
-        };
-        res
     }
 }
 
@@ -2371,7 +2728,7 @@ mod tests {
         let config = CompileConfig::default();
         let mut flattener = Flattener::new(&config);
 
-        let flat = flattener.flatten_function(&HashMap::new(), function);
+        let flat = flattener.flatten_function(function);
         let expected = FlatFunction {
             arguments: vec![],
             statements: vec![
@@ -2389,6 +2746,7 @@ mod tests {
                         box FlatExpression::Identifier(FlatVariable::new(0)),
                         box FlatExpression::Number(Bn128Field::from(1)),
                     ),
+                    RuntimeError::Source,
                 ),
             ],
         };
@@ -2421,7 +2779,7 @@ mod tests {
                 ZirStatement::Assertion(BooleanExpression::FieldEq(
                     box FieldElementExpression::Add(
                         box FieldElementExpression::Identifier("x".into()),
-                        box FieldElementExpression::Number(Bn128Field::from(1)).into(),
+                        box FieldElementExpression::Number(Bn128Field::from(1)),
                     ),
                     box FieldElementExpression::Identifier("y".into()),
                 )),
@@ -2435,7 +2793,7 @@ mod tests {
         let config = CompileConfig::default();
         let mut flattener = Flattener::new(&config);
 
-        let flat = flattener.flatten_function(&HashMap::new(), function);
+        let flat = flattener.flatten_function(function);
         let expected = FlatFunction {
             arguments: vec![],
             statements: vec![
@@ -2456,6 +2814,7 @@ mod tests {
                         ),
                         box FlatExpression::Number(Bn128Field::from(1)),
                     ),
+                    RuntimeError::Source,
                 ),
             ],
         };
@@ -2503,7 +2862,7 @@ mod tests {
         let config = CompileConfig::default();
         let mut flattener = Flattener::new(&config);
 
-        let flat = flattener.flatten_function(&HashMap::new(), function);
+        let flat = flattener.flatten_function(function);
         let expected = FlatFunction {
             arguments: vec![],
             statements: vec![
@@ -2517,6 +2876,7 @@ mod tests {
                         box FlatExpression::Identifier(FlatVariable::new(0)),
                         box FlatExpression::Number(Bn128Field::from(1)),
                     ),
+                    RuntimeError::Source,
                 ),
             ],
         };
@@ -2560,7 +2920,7 @@ mod tests {
         let config = CompileConfig::default();
         let mut flattener = Flattener::new(&config);
 
-        let flat = flattener.flatten_function(&HashMap::new(), function);
+        let flat = flattener.flatten_function(function);
         let expected = FlatFunction {
             arguments: vec![],
             statements: vec![
@@ -2578,6 +2938,7 @@ mod tests {
                         box FlatExpression::Identifier(FlatVariable::new(0)),
                         box FlatExpression::Number(Bn128Field::from(1)),
                     ),
+                    RuntimeError::Source,
                 ),
             ],
         };
@@ -2630,7 +2991,7 @@ mod tests {
         let config = CompileConfig::default();
         let mut flattener = Flattener::new(&config);
 
-        let flat = flattener.flatten_function(&HashMap::new(), function);
+        let flat = flattener.flatten_function(function);
         let expected = FlatFunction {
             arguments: vec![],
             statements: vec![
@@ -2652,6 +3013,7 @@ mod tests {
                         box FlatExpression::Identifier(FlatVariable::new(0)),
                         box FlatExpression::Identifier(FlatVariable::new(1)),
                     ),
+                    RuntimeError::Source,
                 ),
             ],
         };
@@ -2704,7 +3066,7 @@ mod tests {
         let config = CompileConfig::default();
         let mut flattener = Flattener::new(&config);
 
-        let flat = flattener.flatten_function(&HashMap::new(), function);
+        let flat = flattener.flatten_function(function);
         let expected = FlatFunction {
             arguments: vec![],
             statements: vec![
@@ -2726,6 +3088,7 @@ mod tests {
                         box FlatExpression::Identifier(FlatVariable::new(0)),
                         box FlatExpression::Identifier(FlatVariable::new(1)),
                     ),
+                    RuntimeError::Source,
                 ),
             ],
         };
@@ -2788,7 +3151,7 @@ mod tests {
         let config = CompileConfig::default();
         let mut flattener = Flattener::new(&config);
 
-        let flat = flattener.flatten_function(&HashMap::new(), function);
+        let flat = flattener.flatten_function(function);
         let expected = FlatFunction {
             arguments: vec![],
             statements: vec![
@@ -2821,6 +3184,7 @@ mod tests {
                         box FlatExpression::Identifier(FlatVariable::new(0)),
                         box FlatExpression::Identifier(FlatVariable::new(1)),
                     ),
+                    RuntimeError::Source,
                 ),
             ],
         };
@@ -2850,7 +3214,7 @@ mod tests {
                     Variable::field_element("b"),
                     FieldElementExpression::Pow(
                         box FieldElementExpression::Identifier("a".into()),
-                        box FieldElementExpression::Number(Bn128Field::from(0)),
+                        box 0u32.into(),
                     )
                     .into(),
                 ),
@@ -2882,7 +3246,7 @@ mod tests {
             ],
         };
 
-        let flattened = flattener.flatten_function(&mut HashMap::new(), function);
+        let flattened = flattener.flatten_function(function);
 
         assert_eq!(flattened, expected);
     }
@@ -2910,7 +3274,7 @@ mod tests {
                     Variable::field_element("b"),
                     FieldElementExpression::Pow(
                         box FieldElementExpression::Identifier("a".into()),
-                        box FieldElementExpression::Number(Bn128Field::from(1)),
+                        box 1u32.into(),
                     )
                     .into(),
                 ),
@@ -2945,7 +3309,7 @@ mod tests {
             ],
         };
 
-        let flattened = flattener.flatten_function(&mut HashMap::new(), function);
+        let flattened = flattener.flatten_function(function);
 
         assert_eq!(flattened, expected);
     }
@@ -2990,7 +3354,7 @@ mod tests {
                     Variable::field_element("b"),
                     FieldElementExpression::Pow(
                         box FieldElementExpression::Identifier("a".into()),
-                        box FieldElementExpression::Number(Bn128Field::from(13)),
+                        box 13u32.into(),
                     )
                     .into(),
                 ),
@@ -3060,7 +3424,7 @@ mod tests {
             ],
         };
 
-        let flattened = flattener.flatten_function(&mut HashMap::new(), function);
+        let flattened = flattener.flatten_function(function);
 
         assert_eq!(flattened, expected);
     }
@@ -3079,33 +3443,25 @@ mod tests {
 
         let mut flattener = Flattener::new(&config);
 
-        flattener.flatten_field_expression(&HashMap::new(), &mut FlatStatements::new(), expression);
+        flattener.flatten_field_expression(&mut FlatStatements::new(), expression);
     }
 
     #[test]
     fn geq_leq() {
         let config = CompileConfig::default();
         let mut flattener = Flattener::new(&config);
-        let expression_le = BooleanExpression::Le(
+        let expression_le = BooleanExpression::FieldLe(
             box FieldElementExpression::Number(Bn128Field::from(32)),
             box FieldElementExpression::Number(Bn128Field::from(4)),
         );
-        flattener.flatten_boolean_expression(
-            &HashMap::new(),
-            &mut FlatStatements::new(),
-            expression_le,
-        );
+        flattener.flatten_boolean_expression(&mut FlatStatements::new(), expression_le);
 
         let mut flattener = Flattener::new(&config);
-        let expression_ge = BooleanExpression::Ge(
+        let expression_ge = BooleanExpression::FieldGe(
             box FieldElementExpression::Number(Bn128Field::from(32)),
             box FieldElementExpression::Number(Bn128Field::from(4)),
         );
-        flattener.flatten_boolean_expression(
-            &HashMap::new(),
-            &mut FlatStatements::new(),
-            expression_ge,
-        );
+        flattener.flatten_boolean_expression(&mut FlatStatements::new(), expression_ge);
     }
 
     #[test]
@@ -3119,7 +3475,7 @@ mod tests {
                     box FieldElementExpression::Number(Bn128Field::from(4)),
                     box FieldElementExpression::Number(Bn128Field::from(4)),
                 ),
-                box BooleanExpression::Lt(
+                box BooleanExpression::FieldLt(
                     box FieldElementExpression::Number(Bn128Field::from(4)),
                     box FieldElementExpression::Number(Bn128Field::from(20)),
                 ),
@@ -3128,7 +3484,7 @@ mod tests {
             box FieldElementExpression::Number(Bn128Field::from(51)),
         );
 
-        flattener.flatten_field_expression(&HashMap::new(), &mut FlatStatements::new(), expression);
+        flattener.flatten_field_expression(&mut FlatStatements::new(), expression);
     }
 
     #[test]
@@ -3155,9 +3511,9 @@ mod tests {
             .into(),
         );
 
-        flattener.flatten_statement(&HashMap::new(), &mut statements_flattened, definition);
+        flattener.flatten_statement(&mut statements_flattened, definition);
 
-        flattener.flatten_statement(&HashMap::new(), &mut statements_flattened, statement);
+        flattener.flatten_statement(&mut statements_flattened, statement);
 
         // define b
         let b = FlatVariable::new(0);
@@ -3193,6 +3549,7 @@ mod tests {
                 FlatStatement::Condition(
                     FlatExpression::Number(Bn128Field::from(1)),
                     FlatExpression::Mult(box invb0.into(), box b0.into()),
+                    RuntimeError::Inverse,
                 ),
                 // execute div
                 FlatStatement::Directive(FlatDirective::new(
@@ -3203,6 +3560,7 @@ mod tests {
                 FlatStatement::Condition(
                     five.into(),
                     FlatExpression::Mult(box b0.into(), box sym_0.into()),
+                    RuntimeError::Division
                 ),
                 // inputs to second div (res/b)
                 FlatStatement::Definition(sym_1, sym_0.into()),
@@ -3216,6 +3574,7 @@ mod tests {
                 FlatStatement::Condition(
                     FlatExpression::Number(Bn128Field::from(1)),
                     FlatExpression::Mult(box invb1.into(), box b1.into()),
+                    RuntimeError::Inverse
                 ),
                 // execute div
                 FlatStatement::Directive(FlatDirective::new(
@@ -3226,6 +3585,7 @@ mod tests {
                 FlatStatement::Condition(
                     sym_1.into(),
                     FlatExpression::Mult(box b1.into(), box sym_2.into()),
+                    RuntimeError::Division
                 ),
             ]
         );

@@ -25,7 +25,7 @@ pub fn prepare_public_inputs<T: Field>(public_inputs: Vec<T>) -> (Vec<[u8; 32]>,
     let mut public_inputs_arr: Vec<[u8; 32]> = vec![[0u8; 32]; public_inputs_length];
 
     for (index, value) in public_inputs.into_iter().enumerate() {
-        public_inputs_arr[index] = vec_as_u8_32_array(&value.into_byte_vector());
+        public_inputs_arr[index] = vec_as_u8_32_array(&value.to_byte_vector());
     }
 
     (public_inputs_arr, public_inputs_length)
@@ -62,21 +62,21 @@ pub fn prepare_setup<T: Field>(
             a_vec.push((
                 row as i32,
                 idx as i32,
-                vec_as_u8_32_array(&val.into_byte_vector()),
+                vec_as_u8_32_array(&val.to_byte_vector()),
             ));
         }
         for &(idx, ref val) in &b[row] {
             b_vec.push((
                 row as i32,
                 idx as i32,
-                vec_as_u8_32_array(&val.into_byte_vector()),
+                vec_as_u8_32_array(&val.to_byte_vector()),
             ));
         }
         for &(idx, ref val) in &c[row] {
             c_vec.push((
                 row as i32,
                 idx as i32,
-                vec_as_u8_32_array(&val.into_byte_vector()),
+                vec_as_u8_32_array(&val.to_byte_vector()),
             ));
         }
     }
@@ -177,10 +177,10 @@ pub fn prepare_generate_proof<T: Field>(
 
     //convert inputs
     for (index, value) in public_inputs.into_iter().enumerate() {
-        public_inputs_arr[index] = vec_as_u8_32_array(&value.into_byte_vector());
+        public_inputs_arr[index] = vec_as_u8_32_array(&value.to_byte_vector());
     }
     for (index, value) in private_inputs.into_iter().enumerate() {
-        private_inputs_arr[index] = vec_as_u8_32_array(&value.into_byte_vector());
+        private_inputs_arr[index] = vec_as_u8_32_array(&value.to_byte_vector());
     }
 
     (
@@ -250,7 +250,7 @@ pub fn r1cs_program<T: Field>(
 
     // first pass through statements to populate `variables`
     for (quad, lin) in main.statements.iter().filter_map(|s| match s {
-        Statement::Constraint(quad, lin) => Some((quad, lin)),
+        Statement::Constraint(quad, lin, _) => Some((quad, lin)),
         Statement::Directive(..) => None,
     }) {
         for (k, _) in &quad.left.0 {
@@ -270,7 +270,7 @@ pub fn r1cs_program<T: Field>(
 
     // second pass to convert program to raw sparse vectors
     for (quad, lin) in main.statements.into_iter().filter_map(|s| match s {
-        Statement::Constraint(quad, lin) => Some((quad, lin)),
+        Statement::Constraint(quad, lin, _) => Some((quad, lin)),
         Statement::Directive(..) => None,
     }) {
         a.push(

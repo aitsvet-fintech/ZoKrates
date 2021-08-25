@@ -3,12 +3,13 @@
 //! @file compile.rs
 //! @author Thibaut Schaeffer <thibaut@schaeff.fr>
 //! @date 2018
-use crate::absy::{Module, ModuleId, Program};
+use crate::absy::{Module, OwnedModuleId, Program};
 use crate::flatten::Flattener;
 use crate::imports::{self, Importer};
 use crate::ir;
 use crate::macros;
 use crate::semantics::{self, Checker};
+use crate::static_analysis;
 use crate::static_analysis::Analyse;
 use crate::typed_absy::abi::Abi;
 use crate::zir::ZirProgram;
@@ -17,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use typed_arena::Arena;
 use zokrates_common::Resolver;
 use zokrates_field::Field;
@@ -55,13 +56,14 @@ pub enum CompileErrorInner {
     MacroError(macros::Error),
     SemanticError(semantics::ErrorInner),
     ReadError(io::Error),
+    AnalysisError(static_analysis::Error),
 }
 
 impl CompileErrorInner {
-    pub fn in_file(self, context: &PathBuf) -> CompileError {
+    pub fn in_file(self, context: &Path) -> CompileError {
         CompileError {
             value: self,
-            file: context.clone(),
+            file: context.to_path_buf(),
         }
     }
 }
@@ -129,21 +131,52 @@ impl From<semantics::Error> for CompileError {
     }
 }
 
+impl From<static_analysis::Error> for CompileErrorInner {
+    fn from(error: static_analysis::Error) -> Self {
+        CompileErrorInner::AnalysisError(error)
+    }
+}
+
 impl fmt::Display for CompileErrorInner {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            CompileErrorInner::ParserError(ref e) => write!(f, "{}", e),
-            CompileErrorInner::MacroError(ref e) => write!(f, "{}", e),
-            CompileErrorInner::SemanticError(ref e) => write!(f, "{}", e),
-            CompileErrorInner::ReadError(ref e) => write!(f, "{}", e),
-            CompileErrorInner::ImportError(ref e) => write!(f, "{}", e),
+            CompileErrorInner::ParserError(ref e) => write!(f, "\n\t{}", e),
+            CompileErrorInner::MacroError(ref e) => write!(f, "\n\t{}", e),
+            CompileErrorInner::SemanticError(ref e) => {
+                let location = e
+                    .pos()
+                    .map(|p| format!("{}", p.0))
+                    .unwrap_or_else(|| "".to_string());
+                write!(f, "{}\n\t{}", location, e.message())
+            }
+            CompileErrorInner::ReadError(ref e) => write!(f, "\n\t{}", e),
+            CompileErrorInner::ImportError(ref e) => {
+                let location = e
+                    .pos()
+                    .map(|p| format!("{}", p.0))
+                    .unwrap_or_else(|| "".to_string());
+                write!(f, "{}\n\t{}", location, e.message())
+            }
+            CompileErrorInner::AnalysisError(ref e) => write!(f, "\n\t{}", e),
         }
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct CompileConfig {
     pub allow_unconstrained_variables: bool,
+    pub isolate_branches: bool,
+}
+
+impl CompileConfig {
+    pub fn allow_unconstrained_variables(mut self, flag: bool) -> Self {
+        self.allow_unconstrained_variables = flag;
+        self
+    }
+    pub fn isolate_branches(mut self, flag: bool) -> Self {
+        self.isolate_branches = flag;
+        self
+    }
 }
 
 type FilePath = PathBuf;
@@ -156,21 +189,26 @@ pub fn compile<T: Field, E: Into<imports::Error>>(
 ) -> Result<CompilationArtifacts<T>, CompileErrors> {
     let arena = Arena::new();
 
-    let (typed_ast, abi) = check_with_arena(source, location, resolver, &arena)?;
+    let (typed_ast, abi) = check_with_arena(source, location, resolver, config, &arena)?;
 
     // flatten input program
+    log::debug!("Flatten");
     let program_flattened = Flattener::flatten(typed_ast, config);
 
     // analyse (constant propagation after call resolution)
+    log::debug!("Analyse flat program");
     let program_flattened = program_flattened.analyse();
 
     // convert to ir
+    log::debug!("Convert to IR");
     let ir_prog = ir::Prog::from(program_flattened);
 
     // optimize
+    log::debug!("Optimise IR");
     let optimized_ir_prog = ir_prog.optimize();
 
     // analyse (check constraints)
+    log::debug!("Analyse IR");
     let optimized_ir_prog = optimized_ir_prog.analyse();
 
     Ok(CompilationArtifacts {
@@ -179,39 +217,47 @@ pub fn compile<T: Field, E: Into<imports::Error>>(
     })
 }
 
-pub fn check<'ast, T: Field, E: Into<imports::Error>>(
+pub fn check<T: Field, E: Into<imports::Error>>(
     source: String,
     location: FilePath,
     resolver: Option<&dyn Resolver<E>>,
+    config: &CompileConfig,
 ) -> Result<(), CompileErrors> {
     let arena = Arena::new();
 
-    check_with_arena::<T, _>(source, location, resolver, &arena).map(|_| ())
+    check_with_arena::<T, _>(source, location, resolver, config, &arena).map(|_| ())
 }
 
 fn check_with_arena<'ast, T: Field, E: Into<imports::Error>>(
     source: String,
     location: FilePath,
     resolver: Option<&dyn Resolver<E>>,
+    config: &CompileConfig,
     arena: &'ast Arena<String>,
 ) -> Result<(ZirProgram<'ast, T>, Abi), CompileErrors> {
     let source = arena.alloc(source);
-    let compiled = compile_program::<T, E>(source, location.clone(), resolver, &arena)?;
+
+    log::debug!("Parse program with entry file {}", location.display());
+
+    let compiled = parse_program::<T, E>(source, location, resolver, &arena)?;
+
+    log::debug!("Check semantics");
 
     // check semantics
-    let typed_ast = Checker::check(compiled).map_err(|errors| {
-        CompileErrors(errors.into_iter().map(|e| CompileError::from(e)).collect())
-    })?;
+    let typed_ast = Checker::check(compiled)
+        .map_err(|errors| CompileErrors(errors.into_iter().map(CompileError::from).collect()))?;
 
-    let abi = typed_ast.abi();
+    let main_module = typed_ast.main.clone();
+
+    log::debug!("Run static analysis");
 
     // analyse (unroll and constant propagation)
-    let typed_ast = typed_ast.analyse();
-
-    Ok((typed_ast, abi))
+    typed_ast
+        .analyse(config)
+        .map_err(|e| CompileErrors(vec![CompileErrorInner::from(e).in_file(&main_module)]))
 }
 
-pub fn compile_program<'ast, T: Field, E: Into<imports::Error>>(
+pub fn parse_program<'ast, T: Field, E: Into<imports::Error>>(
     source: &'ast str,
     location: FilePath,
     resolver: Option<&dyn Resolver<E>>,
@@ -219,7 +265,7 @@ pub fn compile_program<'ast, T: Field, E: Into<imports::Error>>(
 ) -> Result<Program<'ast>, CompileErrors> {
     let mut modules = HashMap::new();
 
-    let main = compile_module::<T, E>(&source, location.clone(), resolver, &mut modules, &arena)?;
+    let main = parse_module::<T, E>(&source, location.clone(), resolver, &mut modules, &arena)?;
 
     modules.insert(location.clone(), main);
 
@@ -229,22 +275,30 @@ pub fn compile_program<'ast, T: Field, E: Into<imports::Error>>(
     })
 }
 
-pub fn compile_module<'ast, T: Field, E: Into<imports::Error>>(
+pub fn parse_module<'ast, T: Field, E: Into<imports::Error>>(
     source: &'ast str,
     location: FilePath,
     resolver: Option<&dyn Resolver<E>>,
-    modules: &mut HashMap<ModuleId, Module<'ast>>,
+    modules: &mut HashMap<OwnedModuleId, Module<'ast>>,
     arena: &'ast Arena<String>,
 ) -> Result<Module<'ast>, CompileErrors> {
+    log::debug!("Generate pest AST for {}", location.display());
+
     let ast = pest::generate_ast(&source)
         .map_err(|e| CompileErrors::from(CompileErrorInner::from(e).in_file(&location)))?;
+
+    log::debug!("Process macros for {}", location.display());
 
     let ast = process_macros::<T>(ast)
         .map_err(|e| CompileErrors::from(CompileErrorInner::from(e).in_file(&location)))?;
 
+    log::debug!("Generate absy for {}", location.display());
+
     let module_without_imports: Module = Module::from(ast);
 
-    Importer::new().apply_imports::<T, E>(
+    log::debug!("Apply imports to absy for {}", location.display());
+
+    Importer::apply_imports::<T, E>(
         module_without_imports,
         location.clone(),
         resolver,
@@ -275,7 +329,7 @@ mod test {
         assert!(res.unwrap_err().0[0]
             .value()
             .to_string()
-            .contains(&"Can't resolve import without a resolver"));
+            .contains(&"Cannot resolve import without a resolver"));
     }
 
     #[test]
@@ -380,17 +434,19 @@ struct Bar { field a }
                     inputs: vec![AbiInput {
                         name: "f".into(),
                         public: true,
-                        ty: Type::Struct(StructType::new(
+                        ty: ConcreteType::Struct(ConcreteStructType::new(
                             "foo".into(),
                             "Foo".into(),
-                            vec![StructMember {
+                            vec![],
+                            vec![ConcreteStructMember {
                                 id: "b".into(),
-                                ty: box Type::Struct(StructType::new(
+                                ty: box ConcreteType::Struct(ConcreteStructType::new(
                                     "bar".into(),
                                     "Bar".into(),
-                                    vec![StructMember {
+                                    vec![],
+                                    vec![ConcreteStructMember {
                                         id: "a".into(),
-                                        ty: box Type::FieldElement
+                                        ty: box ConcreteType::FieldElement
                                     }]
                                 ))
                             }]

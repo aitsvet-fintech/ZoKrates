@@ -35,7 +35,7 @@ impl<T: fmt::Display> Node<T> {
 
 pub trait NodeValue: fmt::Display + fmt::Debug + Sized + PartialEq {
     fn at(self, line: usize, col: usize, delta: isize) -> Node<Self> {
-        let start = Position { col, line };
+        let start = Position { line, col };
         Node::new(start, start.col(delta), self)
     }
 
@@ -74,24 +74,25 @@ impl<V: NodeValue> From<V> for Node<V> {
 
 use crate::absy::types::UnresolvedType;
 use crate::absy::*;
-use crate::imports::*;
 
 impl<'ast> NodeValue for Expression<'ast> {}
 impl<'ast> NodeValue for ExpressionList<'ast> {}
 impl<'ast> NodeValue for Assignee<'ast> {}
 impl<'ast> NodeValue for Statement<'ast> {}
 impl<'ast> NodeValue for SymbolDeclaration<'ast> {}
-impl NodeValue for UnresolvedType {}
+impl<'ast> NodeValue for UnresolvedType<'ast> {}
 impl<'ast> NodeValue for StructDefinition<'ast> {}
 impl<'ast> NodeValue for StructDefinitionField<'ast> {}
+impl<'ast> NodeValue for ConstantDefinition<'ast> {}
 impl<'ast> NodeValue for Function<'ast> {}
 impl<'ast> NodeValue for Module<'ast> {}
+impl<'ast> NodeValue for CanonicalImport<'ast> {}
 impl<'ast> NodeValue for SymbolImport<'ast> {}
 impl<'ast> NodeValue for Variable<'ast> {}
 impl<'ast> NodeValue for Parameter<'ast> {}
-impl<'ast> NodeValue for Import<'ast> {}
 impl<'ast> NodeValue for Spread<'ast> {}
 impl<'ast> NodeValue for Range<'ast> {}
+impl<'ast> NodeValue for Identifier<'ast> {}
 
 impl<T: PartialEq> PartialEq for Node<T> {
     fn eq(&self, other: &Node<T>) -> bool {

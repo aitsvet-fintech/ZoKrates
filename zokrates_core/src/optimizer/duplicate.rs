@@ -1,7 +1,8 @@
 //! Module containing the `DuplicateOptimizer` to remove duplicate constraints
 
-use crate::ir::folder::Folder;
+use crate::ir::folder::*;
 use crate::ir::*;
+use crate::optimizer::canonicalizer::Canonicalizer;
 use std::collections::{hash_map::DefaultHasher, HashSet};
 use zokrates_field::Field;
 
@@ -33,6 +34,22 @@ impl DuplicateOptimizer {
 }
 
 impl<T: Field> Folder<T> for DuplicateOptimizer {
+    fn fold_function(&mut self, f: Function<T>) -> Function<T> {
+        // in order to correcty identify duplicates, we need to first canonicalize the statements
+        let mut canonicalizer = Canonicalizer;
+
+        let f = Function {
+            statements: f
+                .statements
+                .into_iter()
+                .flat_map(|s| canonicalizer.fold_statement(s))
+                .collect(),
+            ..f
+        };
+
+        fold_function(self, f)
+    }
+
     fn fold_statement(&mut self, s: Statement<T>) -> Vec<Statement<T>> {
         let hashed = hash(&s);
         let result = match self.seen.get(&hashed) {
@@ -58,14 +75,14 @@ mod tests {
             main: Function {
                 id: "main".to_string(),
                 statements: vec![
-                    Statement::Constraint(
+                    Statement::constraint(
                         QuadComb::from_linear_combinations(
                             LinComb::summand(3, FlatVariable::new(3)),
                             LinComb::summand(3, FlatVariable::new(3)),
                         ),
                         LinComb::one(),
                     ),
-                    Statement::Constraint(
+                    Statement::constraint(
                         QuadComb::from_linear_combinations(
                             LinComb::summand(3, FlatVariable::new(42)),
                             LinComb::summand(3, FlatVariable::new(3)),
@@ -85,7 +102,7 @@ mod tests {
 
     #[test]
     fn remove_duplicates() {
-        let constraint = Statement::Constraint(
+        let constraint = Statement::constraint(
             QuadComb::from_linear_combinations(
                 LinComb::summand(3, FlatVariable::new(3)),
                 LinComb::summand(3, FlatVariable::new(3)),
@@ -100,7 +117,7 @@ mod tests {
                 statements: vec![
                     constraint.clone(),
                     constraint.clone(),
-                    Statement::Constraint(
+                    Statement::constraint(
                         QuadComb::from_linear_combinations(
                             LinComb::summand(3, FlatVariable::new(42)),
                             LinComb::summand(3, FlatVariable::new(3)),
@@ -120,8 +137,8 @@ mod tests {
             main: Function {
                 id: "main".to_string(),
                 statements: vec![
-                    constraint.clone(),
-                    Statement::Constraint(
+                    constraint,
+                    Statement::constraint(
                         QuadComb::from_linear_combinations(
                             LinComb::summand(3, FlatVariable::new(42)),
                             LinComb::summand(3, FlatVariable::new(3)),

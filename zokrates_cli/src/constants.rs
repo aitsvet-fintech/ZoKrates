@@ -5,6 +5,9 @@ pub const PROVING_KEY_DEFAULT_PATH: &str = "proving.key";
 pub const VERIFICATION_CONTRACT_DEFAULT_PATH: &str = "verifier.sol";
 pub const WITNESS_DEFAULT_PATH: &str = "witness";
 pub const JSON_PROOF_PATH: &str = "proof.json";
+pub const UNIVERSAL_SETUP_DEFAULT_PATH: &str = "universal_setup.dat";
+pub const UNIVERSAL_SETUP_DEFAULT_SIZE: &str = "10";
+pub const SMTLIB2_DEFAULT_PATH: &str = "out.smt2";
 
 pub const BELLMAN: &str = "bellman";
 pub const LIBSNARK: &str = "libsnark";
@@ -19,6 +22,7 @@ lazy_static! {
         .unwrap();
 }
 
+#[cfg(any(feature = "bellman", feature = "ark", feature = "libsnark"))]
 pub const BACKENDS: &[&str] = if cfg!(feature = "libsnark") {
     if cfg!(feature = "ark") {
         if cfg!(feature = "bellman") {
@@ -26,27 +30,21 @@ pub const BACKENDS: &[&str] = if cfg!(feature = "libsnark") {
         } else {
             &[LIBSNARK, ARK]
         }
+    } else if cfg!(feature = "bellman") {
+        &[BELLMAN, LIBSNARK]
     } else {
-        if cfg!(feature = "bellman") {
-            &[BELLMAN, LIBSNARK]
-        } else {
-            &[LIBSNARK]
-        }
+        &[LIBSNARK]
     }
+} else if cfg!(feature = "ark") {
+    if cfg!(feature = "bellman") {
+        &[BELLMAN, ARK]
+    } else {
+        &[ARK]
+    }
+} else if cfg!(feature = "bellman") {
+    &[BELLMAN]
 } else {
-    if cfg!(feature = "ark") {
-        if cfg!(feature = "bellman") {
-            &[BELLMAN, ARK]
-        } else {
-            &[ARK]
-        }
-    } else {
-        if cfg!(feature = "bellman") {
-            &[BELLMAN]
-        } else {
-            &[]
-        }
-    }
+    &[]
 };
 
 pub const BN128: &str = "bn128";
@@ -58,5 +56,7 @@ pub const CURVES: &[&str] = &[BN128, BLS12_381, BLS12_377, BW6_761];
 pub const G16: &str = "g16";
 pub const PGHR13: &str = "pghr13";
 pub const GM17: &str = "gm17";
+pub const MARLIN: &str = "marlin";
 
-pub const SCHEMES: &[&str] = &[G16, PGHR13, GM17];
+pub const SCHEMES: &[&str] = &[G16, PGHR13, GM17, MARLIN];
+pub const UNIVERSAL_SCHEMES: &[&str] = &[MARLIN];

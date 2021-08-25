@@ -2,9 +2,10 @@
 
 # Exit if any subcommand fails
 set -e
+export RUSTFLAGS="--remap-path-prefix=$PWD="
 
 if [ -n "$WITH_LIBSNARK" ]; then
-	cargo -Z package-features build --release --package zokrates_cli --features="libsnark"
+	cargo build --release --package zokrates_cli --features="libsnark"
 else
-	cargo build --release
+	cargo build --release --package zokrates_cli
 fi

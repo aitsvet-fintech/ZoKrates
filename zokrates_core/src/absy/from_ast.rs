@@ -1,47 +1,71 @@
 use crate::absy;
-use crate::imports;
 
-use num::ToPrimitive;
 use num_bigint::BigUint;
+use std::path::Path;
 use zokrates_pest_ast as pest;
 
 impl<'ast> From<pest::File<'ast>> for absy::Module<'ast> {
-    fn from(prog: pest::File<'ast>) -> absy::Module<'ast> {
-        absy::Module::with_symbols(
-            prog.structs
-                .into_iter()
-                .map(|t| absy::SymbolDeclarationNode::from(t))
-                .chain(
-                    prog.functions
-                        .into_iter()
-                        .map(|f| absy::SymbolDeclarationNode::from(f)),
-                ),
-        )
-        .imports(prog.imports.into_iter().map(|i| absy::ImportNode::from(i)))
+    fn from(file: pest::File<'ast>) -> absy::Module<'ast> {
+        absy::Module::with_symbols(file.declarations.into_iter().flat_map(|d| match d {
+            pest::SymbolDeclaration::Import(i) => import_directive_to_symbol_vec(i),
+            pest::SymbolDeclaration::Constant(c) => vec![c.into()],
+            pest::SymbolDeclaration::Struct(s) => vec![s.into()],
+            pest::SymbolDeclaration::Function(f) => vec![f.into()],
+        }))
     }
 }
 
-impl<'ast> From<pest::ImportDirective<'ast>> for absy::ImportNode<'ast> {
-    fn from(import: pest::ImportDirective<'ast>) -> absy::ImportNode<'ast> {
-        use crate::absy::NodeValue;
+fn import_directive_to_symbol_vec(
+    import: pest::ImportDirective,
+) -> Vec<absy::SymbolDeclarationNode> {
+    use crate::absy::NodeValue;
 
-        match import {
-            pest::ImportDirective::Main(import) => {
-                imports::Import::new(None, std::path::Path::new(import.source.span.as_str()))
-                    .alias(import.alias.map(|a| a.span.as_str()))
-                    .span(import.span)
+    match import {
+        pest::ImportDirective::Main(import) => {
+            let span = import.span;
+            let source = Path::new(import.source.span.as_str());
+            let id = "main";
+            let alias = import.alias.map(|a| a.span.as_str());
+
+            let import = absy::CanonicalImport {
+                source,
+                id: absy::SymbolIdentifier::from(id).alias(alias),
             }
-            pest::ImportDirective::From(import) => imports::Import::new(
-                Some(import.symbol.span.as_str()),
-                std::path::Path::new(import.source.span.as_str()),
-            )
-            .alias(
-                import
-                    .alias
-                    .map(|a| a.span.as_str())
-                    .or(Some(import.symbol.span.as_str())),
-            )
-            .span(import.span),
+            .span(span.clone());
+
+            vec![absy::SymbolDeclaration {
+                id: alias.unwrap_or(id),
+                symbol: absy::Symbol::Here(absy::SymbolDefinition::Import(import)),
+            }
+            .span(span.clone())]
+        }
+        pest::ImportDirective::From(import) => {
+            let span = import.span;
+            let source = Path::new(import.source.span.as_str());
+            import
+                .symbols
+                .into_iter()
+                .map(|symbol| {
+                    let alias = symbol
+                        .alias
+                        .as_ref()
+                        .map(|a| a.span.as_str())
+                        .unwrap_or_else(|| symbol.id.span.as_str());
+
+                    let import = absy::CanonicalImport {
+                        source,
+                        id: absy::SymbolIdentifier::from(symbol.id.span.as_str())
+                            .alias(Some(alias)),
+                    }
+                    .span(span.clone());
+
+                    absy::SymbolDeclaration {
+                        id: alias,
+                        symbol: absy::Symbol::Here(absy::SymbolDefinition::Import(import)),
+                    }
+                    .span(span.clone())
+                })
+                .collect()
         }
     }
 }
@@ -55,24 +79,29 @@ impl<'ast> From<pest::StructDefinition<'ast>> for absy::SymbolDeclarationNode<'a
         let id = definition.id.span.as_str();
 
         let ty = absy::StructDefinition {
+            generics: definition
+                .generics
+                .into_iter()
+                .map(absy::ConstantGenericNode::from)
+                .collect(),
             fields: definition
                 .fields
                 .into_iter()
-                .map(|f| absy::StructDefinitionFieldNode::from(f))
+                .map(absy::StructDefinitionFieldNode::from)
                 .collect(),
         }
         .span(span.clone());
 
         absy::SymbolDeclaration {
             id,
-            symbol: absy::Symbol::HereType(ty),
+            symbol: absy::Symbol::Here(absy::SymbolDefinition::Struct(ty)),
         }
         .span(span)
     }
 }
 
 impl<'ast> From<pest::StructField<'ast>> for absy::StructDefinitionFieldNode<'ast> {
-    fn from(field: pest::StructField<'ast>) -> absy::StructDefinitionFieldNode {
+    fn from(field: pest::StructField<'ast>) -> absy::StructDefinitionFieldNode<'ast> {
         use crate::absy::NodeValue;
 
         let span = field.span;
@@ -85,13 +114,41 @@ impl<'ast> From<pest::StructField<'ast>> for absy::StructDefinitionFieldNode<'as
     }
 }
 
-impl<'ast> From<pest::Function<'ast>> for absy::SymbolDeclarationNode<'ast> {
-    fn from(function: pest::Function<'ast>) -> absy::SymbolDeclarationNode<'ast> {
+impl<'ast> From<pest::ConstantDefinition<'ast>> for absy::SymbolDeclarationNode<'ast> {
+    fn from(definition: pest::ConstantDefinition<'ast>) -> absy::SymbolDeclarationNode<'ast> {
+        use crate::absy::NodeValue;
+
+        let span = definition.span;
+        let id = definition.id.span.as_str();
+
+        let ty = absy::ConstantDefinition {
+            ty: definition.ty.into(),
+            expression: definition.expression.into(),
+        }
+        .span(span.clone());
+
+        absy::SymbolDeclaration {
+            id,
+            symbol: absy::Symbol::Here(absy::SymbolDefinition::Constant(ty)),
+        }
+        .span(span)
+    }
+}
+
+impl<'ast> From<pest::FunctionDefinition<'ast>> for absy::SymbolDeclarationNode<'ast> {
+    fn from(function: pest::FunctionDefinition<'ast>) -> absy::SymbolDeclarationNode<'ast> {
         use crate::absy::NodeValue;
 
         let span = function.span;
 
         let signature = absy::UnresolvedSignature::new()
+            .generics(
+                function
+                    .generics
+                    .into_iter()
+                    .map(absy::ConstantGenericNode::from)
+                    .collect(),
+            )
             .inputs(
                 function
                     .parameters
@@ -105,7 +162,7 @@ impl<'ast> From<pest::Function<'ast>> for absy::SymbolDeclarationNode<'ast> {
                     .returns
                     .clone()
                     .into_iter()
-                    .map(|r| absy::UnresolvedTypeNode::from(r))
+                    .map(absy::UnresolvedTypeNode::from)
                     .collect(),
             );
 
@@ -115,12 +172,12 @@ impl<'ast> From<pest::Function<'ast>> for absy::SymbolDeclarationNode<'ast> {
             arguments: function
                 .parameters
                 .into_iter()
-                .map(|a| absy::ParameterNode::from(a))
+                .map(absy::ParameterNode::from)
                 .collect(),
             statements: function
                 .statements
                 .into_iter()
-                .flat_map(|s| statements_from_statement(s))
+                .flat_map(statements_from_statement)
                 .collect(),
             signature,
         }
@@ -128,9 +185,19 @@ impl<'ast> From<pest::Function<'ast>> for absy::SymbolDeclarationNode<'ast> {
 
         absy::SymbolDeclaration {
             id,
-            symbol: absy::Symbol::HereFunction(function),
+            symbol: absy::Symbol::Here(absy::SymbolDefinition::Function(function)),
         }
         .span(span)
+    }
+}
+
+impl<'ast> From<pest::IdentifierExpression<'ast>> for absy::ConstantGenericNode<'ast> {
+    fn from(g: pest::IdentifierExpression<'ast>) -> absy::ConstantGenericNode<'ast> {
+        use absy::NodeValue;
+
+        let name = g.span.as_str();
+
+        name.span(g.span)
     }
 }
 
@@ -177,54 +244,73 @@ fn statements_from_definition(definition: pest::DefinitionStatement) -> Vec<absy
 
             let e: absy::ExpressionNode = absy::ExpressionNode::from(definition.expression);
 
-            let s = match e.value {
-                absy::Expression::FunctionCall(..) => absy::Statement::MultipleDefinition(
-                    vec![absy::AssigneeNode::from(a.a.clone())],
-                    e,
-                ),
-                _ => absy::Statement::Definition(absy::AssigneeNode::from(a.a.clone()), e),
-            };
-
-            match a.ty {
-                Some(ty) => {
-                    assert_eq!(a.a.accesses.len(), 0);
-
+            match a {
+                pest::TypedIdentifierOrAssignee::TypedIdentifier(i) => {
                     let declaration = absy::Statement::Declaration(
                         absy::Variable::new(
-                            a.a.id.span.as_str(),
-                            absy::UnresolvedTypeNode::from(ty),
+                            i.identifier.span.as_str(),
+                            absy::UnresolvedTypeNode::from(i.ty),
                         )
-                        .span(a.a.id.span.clone()),
+                        .span(i.identifier.span.clone()),
                     )
                     .span(definition.span.clone());
 
+                    let s = match e.value {
+                        absy::Expression::FunctionCall(..) => absy::Statement::MultipleDefinition(
+                            vec![absy::AssigneeNode::from(i.identifier.clone())],
+                            e,
+                        ),
+                        _ => absy::Statement::Definition(
+                            absy::AssigneeNode::from(i.identifier.clone()),
+                            e,
+                        ),
+                    };
+
                     vec![declaration, s.span(definition.span)]
                 }
-                None => {
-                    // Assignment
+                pest::TypedIdentifierOrAssignee::Assignee(a) => {
+                    let s = match e.value {
+                        absy::Expression::FunctionCall(..) => absy::Statement::MultipleDefinition(
+                            vec![absy::AssigneeNode::from(a)],
+                            e,
+                        ),
+                        _ => absy::Statement::Definition(absy::AssigneeNode::from(a), e),
+                    };
+
                     vec![s.span(definition.span)]
                 }
             }
         }
         _ => {
             // Multidefinition
-            let declarations = lhs.clone().into_iter().filter(|i| i.ty.is_some()).map(|a| {
-                let ty = a.ty;
-                let a = a.a;
+            let declarations = lhs.clone().into_iter().filter_map(|i| match i {
+                pest::TypedIdentifierOrAssignee::TypedIdentifier(i) => {
+                    let ty = i.ty;
+                    let id = i.identifier;
 
-                assert_eq!(a.accesses.len(), 0);
-                absy::Statement::Declaration(
-                    absy::Variable::new(
-                        a.id.span.as_str(),
-                        absy::UnresolvedTypeNode::from(ty.unwrap()),
+                    Some(
+                        absy::Statement::Declaration(
+                            absy::Variable::new(
+                                id.span.as_str(),
+                                absy::UnresolvedTypeNode::from(ty),
+                            )
+                            .span(id.span),
+                        )
+                        .span(i.span),
                     )
-                    .span(a.id.span),
-                )
-                .span(a.span)
+                }
+                _ => None,
             });
+
             let lhs = lhs
                 .into_iter()
-                .map(|i| absy::Assignee::Identifier(i.a.id.span.as_str()).span(i.a.id.span))
+                .map(|i| match i {
+                    pest::TypedIdentifierOrAssignee::TypedIdentifier(i) => {
+                        absy::Assignee::Identifier(i.identifier.span.as_str())
+                            .span(i.identifier.span)
+                    }
+                    pest::TypedIdentifierOrAssignee::Assignee(a) => absy::AssigneeNode::from(a),
+                })
                 .collect();
 
             let multi_def = absy::Statement::MultipleDefinition(
@@ -247,7 +333,7 @@ impl<'ast> From<pest::ReturnStatement<'ast>> for absy::StatementNode<'ast> {
                 expressions: statement
                     .expressions
                     .into_iter()
-                    .map(|e| absy::ExpressionNode::from(e))
+                    .map(absy::ExpressionNode::from)
                     .collect(),
             }
             .span(statement.span.clone()),
@@ -275,7 +361,7 @@ impl<'ast> From<pest::IterationStatement<'ast>> for absy::StatementNode<'ast> {
         let statements: Vec<absy::StatementNode<'ast>> = statement
             .statements
             .into_iter()
-            .flat_map(|s| statements_from_statement(s))
+            .flat_map(statements_from_statement)
             .collect();
 
         let var = absy::Variable::new(index, ty).span(statement.index.span);
@@ -289,7 +375,7 @@ impl<'ast> From<pest::Expression<'ast>> for absy::ExpressionNode<'ast> {
         match expression {
             pest::Expression::Binary(e) => absy::ExpressionNode::from(e),
             pest::Expression::Ternary(e) => absy::ExpressionNode::from(e),
-            pest::Expression::Constant(e) => absy::ExpressionNode::from(e),
+            pest::Expression::Literal(e) => absy::ExpressionNode::from(e),
             pest::Expression::Identifier(e) => absy::ExpressionNode::from(e),
             pest::Expression::Postfix(e) => absy::ExpressionNode::from(e),
             pest::Expression::InlineArray(e) => absy::ExpressionNode::from(e),
@@ -458,7 +544,7 @@ impl<'ast> From<pest::InlineArrayExpression<'ast>> for absy::ExpressionNode<'ast
             array
                 .expressions
                 .into_iter()
-                .map(|e| absy::SpreadOrExpression::from(e))
+                .map(absy::SpreadOrExpression::from)
                 .collect(),
         )
         .span(array.span)
@@ -489,13 +575,8 @@ impl<'ast> From<pest::ArrayInitializerExpression<'ast>> for absy::ExpressionNode
         use crate::absy::NodeValue;
 
         let value = absy::ExpressionNode::from(*initializer.value);
-        let count: absy::ExpressionNode<'ast> = absy::ExpressionNode::from(initializer.count);
-        let count = match count.value {
-            absy::Expression::FieldConstant(v) => v.to_usize().unwrap(),
-            _ => unreachable!(),
-        };
-        absy::Expression::InlineArray(vec![absy::SpreadOrExpression::Expression(value); count])
-            .span(initializer.span)
+        let count = absy::ExpressionNode::from(*initializer.count);
+        absy::Expression::ArrayInitializer(box value, box count).span(initializer.span)
     }
 }
 
@@ -503,10 +584,12 @@ impl<'ast> From<pest::UnaryExpression<'ast>> for absy::ExpressionNode<'ast> {
     fn from(unary: pest::UnaryExpression<'ast>) -> absy::ExpressionNode<'ast> {
         use crate::absy::NodeValue;
 
+        let expression = Box::new(absy::ExpressionNode::from(*unary.expression));
+
         match unary.op {
-            pest::UnaryOperator::Not(_) => {
-                absy::Expression::Not(Box::new(absy::ExpressionNode::from(*unary.expression)))
-            }
+            pest::UnaryOperator::Not(..) => absy::Expression::Not(expression),
+            pest::UnaryOperator::Neg(..) => absy::Expression::Neg(expression),
+            pest::UnaryOperator::Pos(..) => absy::Expression::Pos(expression),
         }
         .span(unary.span)
     }
@@ -527,9 +610,25 @@ impl<'ast> From<pest::PostfixExpression<'ast>> for absy::ExpressionNode<'ast> {
             pest::Access::Call(a) => match acc.value {
                 absy::Expression::Identifier(_) => absy::Expression::FunctionCall(
                     &id_str,
-                    a.expressions
+                    a.explicit_generics.map(|explicit_generics| {
+                        explicit_generics
+                            .values
+                            .into_iter()
+                            .map(|i| match i {
+                                pest::ConstantGenericValue::Underscore(_) => None,
+                                pest::ConstantGenericValue::Value(v) => {
+                                    Some(absy::ExpressionNode::from(v))
+                                }
+                                pest::ConstantGenericValue::Identifier(i) => {
+                                    Some(absy::Expression::Identifier(i.span.as_str()).span(i.span))
+                                }
+                            })
+                            .collect()
+                    }),
+                    a.arguments
+                        .expressions
                         .into_iter()
-                        .map(|e| absy::ExpressionNode::from(e))
+                        .map(absy::ExpressionNode::from)
                         .collect(),
                 ),
                 e => unimplemented!("only identifiers are callable, found \"{}\"", e),
@@ -546,29 +645,69 @@ impl<'ast> From<pest::PostfixExpression<'ast>> for absy::ExpressionNode<'ast> {
     }
 }
 
-impl<'ast> From<pest::ConstantExpression<'ast>> for absy::ExpressionNode<'ast> {
-    fn from(expression: pest::ConstantExpression<'ast>) -> absy::ExpressionNode<'ast> {
+impl<'ast> From<pest::DecimalLiteralExpression<'ast>> for absy::ExpressionNode<'ast> {
+    fn from(expression: pest::DecimalLiteralExpression<'ast>) -> absy::ExpressionNode<'ast> {
         use crate::absy::NodeValue;
+
+        match expression.suffix {
+            Some(suffix) => match suffix {
+                pest::DecimalSuffix::Field(_) => absy::Expression::FieldConstant(
+                    BigUint::parse_bytes(&expression.value.span.as_str().as_bytes(), 10).unwrap(),
+                ),
+                pest::DecimalSuffix::U64(_) => {
+                    absy::Expression::U64Constant(expression.value.span.as_str().parse().unwrap())
+                }
+                pest::DecimalSuffix::U32(_) => {
+                    absy::Expression::U32Constant(expression.value.span.as_str().parse().unwrap())
+                }
+                pest::DecimalSuffix::U16(_) => {
+                    absy::Expression::U16Constant(expression.value.span.as_str().parse().unwrap())
+                }
+                pest::DecimalSuffix::U8(_) => {
+                    absy::Expression::U8Constant(expression.value.span.as_str().parse().unwrap())
+                }
+            }
+            .span(expression.span),
+            None => absy::Expression::IntConstant(
+                BigUint::parse_bytes(&expression.value.span.as_str().as_bytes(), 10).unwrap(),
+            )
+            .span(expression.span),
+        }
+    }
+}
+
+impl<'ast> From<pest::HexLiteralExpression<'ast>> for absy::ExpressionNode<'ast> {
+    fn from(expression: pest::HexLiteralExpression<'ast>) -> absy::ExpressionNode<'ast> {
+        use crate::absy::NodeValue;
+
+        match expression.value {
+            pest::HexNumberExpression::U64(e) => {
+                absy::Expression::U64Constant(u64::from_str_radix(&e.span.as_str(), 16).unwrap())
+            }
+            pest::HexNumberExpression::U32(e) => {
+                absy::Expression::U32Constant(u32::from_str_radix(&e.span.as_str(), 16).unwrap())
+            }
+            pest::HexNumberExpression::U16(e) => {
+                absy::Expression::U16Constant(u16::from_str_radix(&e.span.as_str(), 16).unwrap())
+            }
+            pest::HexNumberExpression::U8(e) => {
+                absy::Expression::U8Constant(u8::from_str_radix(&e.span.as_str(), 16).unwrap())
+            }
+        }
+        .span(expression.span)
+    }
+}
+
+impl<'ast> From<pest::LiteralExpression<'ast>> for absy::ExpressionNode<'ast> {
+    fn from(expression: pest::LiteralExpression<'ast>) -> absy::ExpressionNode<'ast> {
+        use crate::absy::NodeValue;
+
         match expression {
-            pest::ConstantExpression::BooleanLiteral(c) => {
+            pest::LiteralExpression::BooleanLiteral(c) => {
                 absy::Expression::BooleanConstant(c.value.parse().unwrap()).span(c.span)
             }
-            pest::ConstantExpression::DecimalNumber(n) => absy::Expression::FieldConstant(
-                BigUint::parse_bytes(&n.value.as_bytes(), 10).unwrap(),
-            )
-            .span(n.span),
-            pest::ConstantExpression::U8(n) => absy::Expression::U8Constant(
-                u8::from_str_radix(&n.value.trim_start_matches("0x"), 16).unwrap(),
-            )
-            .span(n.span),
-            pest::ConstantExpression::U16(n) => absy::Expression::U16Constant(
-                u16::from_str_radix(&n.value.trim_start_matches("0x"), 16).unwrap(),
-            )
-            .span(n.span),
-            pest::ConstantExpression::U32(n) => absy::Expression::U32Constant(
-                u32::from_str_radix(&n.value.trim_start_matches("0x"), 16).unwrap(),
-            )
-            .span(n.span),
+            pest::LiteralExpression::DecimalLiteral(n) => absy::ExpressionNode::from(n),
+            pest::LiteralExpression::HexLiteral(n) => absy::ExpressionNode::from(n),
         }
     }
 }
@@ -609,8 +748,8 @@ impl<'ast> From<pest::Assignee<'ast>> for absy::AssigneeNode<'ast> {
     }
 }
 
-impl<'ast> From<pest::Type<'ast>> for absy::UnresolvedTypeNode {
-    fn from(t: pest::Type<'ast>) -> absy::UnresolvedTypeNode {
+impl<'ast> From<pest::Type<'ast>> for absy::UnresolvedTypeNode<'ast> {
+    fn from(t: pest::Type<'ast>) -> absy::UnresolvedTypeNode<'ast> {
         use crate::absy::types::UnresolvedType;
         use crate::absy::NodeValue;
 
@@ -621,6 +760,7 @@ impl<'ast> From<pest::Type<'ast>> for absy::UnresolvedTypeNode {
                 pest::BasicType::U8(t) => UnresolvedType::Uint(8).span(t.span),
                 pest::BasicType::U16(t) => UnresolvedType::Uint(16).span(t.span),
                 pest::BasicType::U32(t) => UnresolvedType::Uint(32).span(t.span),
+                pest::BasicType::U64(t) => UnresolvedType::Uint(64).span(t.span),
             },
             pest::Type::Array(t) => {
                 let inner_type = match t.ty {
@@ -630,31 +770,34 @@ impl<'ast> From<pest::Type<'ast>> for absy::UnresolvedTypeNode {
                         pest::BasicType::U8(t) => UnresolvedType::Uint(8).span(t.span),
                         pest::BasicType::U16(t) => UnresolvedType::Uint(16).span(t.span),
                         pest::BasicType::U32(t) => UnresolvedType::Uint(32).span(t.span),
+                        pest::BasicType::U64(t) => UnresolvedType::Uint(64).span(t.span),
                     },
-                    pest::BasicOrStructType::Struct(t) => {
-                        UnresolvedType::User(t.span.as_str().to_string()).span(t.span)
-                    }
+                    pest::BasicOrStructType::Struct(t) => UnresolvedType::User(
+                        t.id.span.as_str().to_string(),
+                        t.explicit_generics.map(|explicit_generics| {
+                            explicit_generics
+                                .values
+                                .into_iter()
+                                .map(|i| match i {
+                                    pest::ConstantGenericValue::Underscore(_) => None,
+                                    pest::ConstantGenericValue::Value(v) => {
+                                        Some(absy::ExpressionNode::from(v))
+                                    }
+                                    pest::ConstantGenericValue::Identifier(i) => Some(
+                                        absy::Expression::Identifier(i.span.as_str()).span(i.span),
+                                    ),
+                                })
+                                .collect()
+                        }),
+                    )
+                    .span(t.span),
                 };
 
                 let span = t.span;
 
                 t.dimensions
                     .into_iter()
-                    .map(|s| match s {
-                        pest::Expression::Constant(c) => match c {
-                            pest::ConstantExpression::DecimalNumber(n) => {
-                                str::parse::<usize>(&n.value).unwrap()
-                            }
-                            _ => unimplemented!(
-                                "Array size should be a decimal number, found {}",
-                                c.span().as_str()
-                            ),
-                        },
-                        e => unimplemented!(
-                            "Array size should be constant, found {}",
-                            e.span().as_str()
-                        ),
-                    })
+                    .map(absy::ExpressionNode::from)
                     .rev()
                     .fold(None, |acc, s| match acc {
                         None => Some(UnresolvedType::array(inner_type.clone(), s)),
@@ -663,9 +806,25 @@ impl<'ast> From<pest::Type<'ast>> for absy::UnresolvedTypeNode {
                     .unwrap()
                     .span(span.clone())
             }
-            pest::Type::Struct(s) => {
-                UnresolvedType::User(s.id.span.as_str().to_string()).span(s.span)
-            }
+            pest::Type::Struct(s) => UnresolvedType::User(
+                s.id.span.as_str().to_string(),
+                s.explicit_generics.map(|explicit_generics| {
+                    explicit_generics
+                        .values
+                        .into_iter()
+                        .map(|i| match i {
+                            pest::ConstantGenericValue::Underscore(_) => None,
+                            pest::ConstantGenericValue::Value(v) => {
+                                Some(absy::ExpressionNode::from(v))
+                            }
+                            pest::ConstantGenericValue::Identifier(i) => {
+                                Some(absy::Expression::Identifier(i.span.as_str()).span(i.span))
+                            }
+                        })
+                        .collect()
+                }),
+            )
+            .span(s.span),
         }
     }
 }
@@ -683,15 +842,14 @@ mod tests {
         let expected: absy::Module = absy::Module {
             symbols: vec![absy::SymbolDeclaration {
                 id: &source[4..8],
-                symbol: absy::Symbol::HereFunction(
+                symbol: absy::Symbol::Here(absy::SymbolDefinition::Function(
                     absy::Function {
                         arguments: vec![],
                         statements: vec![absy::Statement::Return(
                             absy::ExpressionList {
-                                expressions: vec![absy::Expression::FieldConstant(BigUint::from(
-                                    42u32,
-                                ))
-                                .into()],
+                                expressions: vec![
+                                    absy::Expression::IntConstant(42usize.into()).into()
+                                ],
                             }
                             .into(),
                         )
@@ -701,10 +859,9 @@ mod tests {
                             .outputs(vec![UnresolvedType::FieldElement.mock()]),
                     }
                     .into(),
-                ),
+                )),
             }
             .into()],
-            imports: vec![],
         };
         assert_eq!(absy::Module::from(ast), expected);
     }
@@ -716,7 +873,7 @@ mod tests {
         let expected: absy::Module = absy::Module {
             symbols: vec![absy::SymbolDeclaration {
                 id: &source[4..8],
-                symbol: absy::Symbol::HereFunction(
+                symbol: absy::Symbol::Here(absy::SymbolDefinition::Function(
                     absy::Function {
                         arguments: vec![],
                         statements: vec![absy::Statement::Return(
@@ -731,10 +888,9 @@ mod tests {
                             .outputs(vec![UnresolvedType::Boolean.mock()]),
                     }
                     .into(),
-                ),
+                )),
             }
             .into()],
-            imports: vec![],
         };
         assert_eq!(absy::Module::from(ast), expected);
     }
@@ -747,7 +903,7 @@ mod tests {
         let expected: absy::Module = absy::Module {
             symbols: vec![absy::SymbolDeclaration {
                 id: &source[4..8],
-                symbol: absy::Symbol::HereFunction(
+                symbol: absy::Symbol::Here(absy::SymbolDefinition::Function(
                     absy::Function {
                         arguments: vec![
                             absy::Parameter::private(
@@ -769,10 +925,9 @@ mod tests {
                         ],
                         statements: vec![absy::Statement::Return(
                             absy::ExpressionList {
-                                expressions: vec![absy::Expression::FieldConstant(BigUint::from(
-                                    42u32,
-                                ))
-                                .into()],
+                                expressions: vec![
+                                    absy::Expression::IntConstant(42usize.into()).into()
+                                ],
                             }
                             .into(),
                         )
@@ -785,10 +940,9 @@ mod tests {
                             .outputs(vec![UnresolvedType::FieldElement.mock()]),
                     }
                     .into(),
-                ),
+                )),
             }
             .into()],
-            imports: vec![],
         };
 
         assert_eq!(absy::Module::from(ast), expected);
@@ -798,11 +952,11 @@ mod tests {
         use super::*;
 
         /// Helper method to generate the ast for `def main(private {ty} a): return` which we use to check ty
-        fn wrap(ty: UnresolvedType) -> absy::Module<'static> {
+        fn wrap(ty: UnresolvedType<'static>) -> absy::Module<'static> {
             absy::Module {
                 symbols: vec![absy::SymbolDeclaration {
                     id: "main",
-                    symbol: absy::Symbol::HereFunction(
+                    symbol: absy::Symbol::Here(absy::SymbolDefinition::Function(
                         absy::Function {
                             arguments: vec![absy::Parameter::private(
                                 absy::Variable::new("a", ty.clone().mock()).into(),
@@ -818,10 +972,9 @@ mod tests {
                             signature: UnresolvedSignature::new().inputs(vec![ty.mock()]),
                         }
                         .into(),
-                    ),
+                    )),
                 }
                 .into()],
-                imports: vec![],
             }
         }
 
@@ -832,21 +985,31 @@ mod tests {
                 ("bool", UnresolvedType::Boolean),
                 (
                     "field[2]",
-                    UnresolvedType::Array(box UnresolvedType::FieldElement.mock(), 2),
-                ),
-                (
-                    "field[2][3]",
-                    UnresolvedType::Array(
-                        box UnresolvedType::Array(box UnresolvedType::FieldElement.mock(), 3)
-                            .mock(),
-                        2,
+                    absy::UnresolvedType::Array(
+                        box absy::UnresolvedType::FieldElement.mock(),
+                        absy::Expression::IntConstant(2usize.into()).mock(),
                     ),
                 ),
                 (
-                    "bool[2][3]",
-                    UnresolvedType::Array(
-                        box UnresolvedType::Array(box UnresolvedType::Boolean.mock(), 3).mock(),
-                        2,
+                    "field[2][3]",
+                    absy::UnresolvedType::Array(
+                        box absy::UnresolvedType::Array(
+                            box absy::UnresolvedType::FieldElement.mock(),
+                            absy::Expression::IntConstant(3usize.into()).mock(),
+                        )
+                        .mock(),
+                        absy::Expression::IntConstant(2usize.into()).mock(),
+                    ),
+                ),
+                (
+                    "bool[2][3u32]",
+                    absy::UnresolvedType::Array(
+                        box absy::UnresolvedType::Array(
+                            box absy::UnresolvedType::Boolean.mock(),
+                            absy::Expression::U32Constant(3u32).mock(),
+                        )
+                        .mock(),
+                        absy::Expression::IntConstant(2usize.into()).mock(),
                     ),
                 ),
             ];
@@ -866,7 +1029,7 @@ mod tests {
             absy::Module {
                 symbols: vec![absy::SymbolDeclaration {
                     id: "main",
-                    symbol: absy::Symbol::HereFunction(
+                    symbol: absy::Symbol::Here(absy::SymbolDefinition::Function(
                         absy::Function {
                             arguments: vec![],
                             statements: vec![absy::Statement::Return(
@@ -879,10 +1042,9 @@ mod tests {
                             signature: UnresolvedSignature::new(),
                         }
                         .into(),
-                    ),
+                    )),
                 }
                 .into()],
-                imports: vec![],
             }
         }
 
@@ -891,15 +1053,14 @@ mod tests {
             // we basically accept `()?[]*` : an optional call at first, then only array accesses
 
             let vectors = vec![
-                ("a", absy::Expression::Identifier("a").into()),
+                ("a", absy::Expression::Identifier("a")),
                 (
                     "a[3]",
                     absy::Expression::Select(
                         box absy::Expression::Identifier("a").into(),
                         box absy::RangeOrExpression::Expression(
-                            absy::Expression::FieldConstant(BigUint::from(3u32)).into(),
-                        )
-                        .into(),
+                            absy::Expression::IntConstant(3usize.into()).into(),
+                        ),
                     ),
                 ),
                 (
@@ -908,15 +1069,13 @@ mod tests {
                         box absy::Expression::Select(
                             box absy::Expression::Identifier("a").into(),
                             box absy::RangeOrExpression::Expression(
-                                absy::Expression::FieldConstant(BigUint::from(3u32)).into(),
-                            )
-                            .into(),
+                                absy::Expression::IntConstant(3usize.into()).into(),
+                            ),
                         )
                         .into(),
                         box absy::RangeOrExpression::Expression(
-                            absy::Expression::FieldConstant(BigUint::from(4u32)).into(),
-                        )
-                        .into(),
+                            absy::Expression::IntConstant(4usize.into()).into(),
+                        ),
                     ),
                 ),
                 (
@@ -924,13 +1083,13 @@ mod tests {
                     absy::Expression::Select(
                         box absy::Expression::FunctionCall(
                             "a",
-                            vec![absy::Expression::FieldConstant(BigUint::from(3u32)).into()],
+                            None,
+                            vec![absy::Expression::IntConstant(3usize.into()).into()],
                         )
                         .into(),
                         box absy::RangeOrExpression::Expression(
-                            absy::Expression::FieldConstant(BigUint::from(4u32)).into(),
-                        )
-                        .into(),
+                            absy::Expression::IntConstant(4usize.into()).into(),
+                        ),
                     ),
                 ),
                 (
@@ -939,19 +1098,18 @@ mod tests {
                         box absy::Expression::Select(
                             box absy::Expression::FunctionCall(
                                 "a",
-                                vec![absy::Expression::FieldConstant(BigUint::from(3u32)).into()],
+                                None,
+                                vec![absy::Expression::IntConstant(3usize.into()).into()],
                             )
                             .into(),
                             box absy::RangeOrExpression::Expression(
-                                absy::Expression::FieldConstant(BigUint::from(4u32)).into(),
-                            )
-                            .into(),
+                                absy::Expression::IntConstant(4usize.into()).into(),
+                            ),
                         )
                         .into(),
                         box absy::RangeOrExpression::Expression(
-                            absy::Expression::FieldConstant(BigUint::from(5u32)).into(),
-                        )
-                        .into(),
+                            absy::Expression::IntConstant(5usize.into()).into(),
+                        ),
                     ),
                 ),
             ];
@@ -991,24 +1149,23 @@ mod tests {
         // For different definitions, we generate declarations
         // Case 1: `id = expr` where `expr` is not a function call
         // This is a simple assignment, doesn't implicitely declare a variable
-        // A `Definition` is generatedm and no `Declaration`s
+        // A `Definition` is generated and no `Declaration`s
 
         let definition = pest::DefinitionStatement {
-            lhs: vec![pest::OptionallyTypedAssignee {
-                ty: None,
-                a: pest::Assignee {
-                    id: pest::IdentifierExpression {
-                        value: String::from("a"),
-                        span: span.clone(),
-                    },
-                    accesses: vec![],
+            lhs: vec![pest::TypedIdentifierOrAssignee::Assignee(pest::Assignee {
+                id: pest::IdentifierExpression {
+                    value: String::from("a"),
                     span: span.clone(),
                 },
+                accesses: vec![],
                 span: span.clone(),
-            }],
-            expression: pest::Expression::Constant(pest::ConstantExpression::DecimalNumber(
-                pest::DecimalNumberExpression {
-                    value: String::from("42"),
+            })],
+            expression: pest::Expression::Literal(pest::LiteralExpression::DecimalLiteral(
+                pest::DecimalLiteralExpression {
+                    value: pest::DecimalNumber {
+                        span: Span::new(&"1", 0, 1).unwrap(),
+                    },
+                    suffix: None,
                     span: span.clone(),
                 },
             )),
@@ -1029,25 +1186,25 @@ mod tests {
         // A MultiDef is generated
 
         let definition = pest::DefinitionStatement {
-            lhs: vec![pest::OptionallyTypedAssignee {
-                ty: None,
-                a: pest::Assignee {
-                    id: pest::IdentifierExpression {
-                        value: String::from("a"),
-                        span: span.clone(),
-                    },
-                    accesses: vec![],
+            lhs: vec![pest::TypedIdentifierOrAssignee::Assignee(pest::Assignee {
+                id: pest::IdentifierExpression {
+                    value: String::from("a"),
                     span: span.clone(),
                 },
+                accesses: vec![],
                 span: span.clone(),
-            }],
+            })],
             expression: pest::Expression::Postfix(pest::PostfixExpression {
                 id: pest::IdentifierExpression {
                     value: String::from("foo"),
                     span: span.clone(),
                 },
                 accesses: vec![pest::Access::Call(pest::CallAccess {
-                    expressions: vec![],
+                    explicit_generics: None,
+                    arguments: pest::Arguments {
+                        expressions: vec![],
+                        span: span.clone(),
+                    },
                     span: span.clone(),
                 })],
                 span: span.clone(),
@@ -1071,32 +1228,24 @@ mod tests {
 
         let definition = pest::DefinitionStatement {
             lhs: vec![
-                pest::OptionallyTypedAssignee {
-                    ty: Some(pest::Type::Basic(pest::BasicType::Field(pest::FieldType {
+                pest::TypedIdentifierOrAssignee::TypedIdentifier(pest::TypedIdentifier {
+                    ty: pest::Type::Basic(pest::BasicType::Field(pest::FieldType {
                         span: span.clone(),
-                    }))),
-                    a: pest::Assignee {
-                        id: pest::IdentifierExpression {
-                            value: String::from("a"),
-                            span: span.clone(),
-                        },
-                        accesses: vec![],
+                    })),
+                    identifier: pest::IdentifierExpression {
+                        value: String::from("a"),
                         span: span.clone(),
                     },
                     span: span.clone(),
-                },
-                pest::OptionallyTypedAssignee {
-                    ty: None,
-                    a: pest::Assignee {
-                        id: pest::IdentifierExpression {
-                            value: String::from("b"),
-                            span: span.clone(),
-                        },
-                        accesses: vec![],
+                }),
+                pest::TypedIdentifierOrAssignee::Assignee(pest::Assignee {
+                    id: pest::IdentifierExpression {
+                        value: String::from("b"),
                         span: span.clone(),
                     },
+                    accesses: vec![],
                     span: span.clone(),
-                },
+                }),
             ],
             expression: pest::Expression::Postfix(pest::PostfixExpression {
                 id: pest::IdentifierExpression {
@@ -1104,7 +1253,11 @@ mod tests {
                     span: span.clone(),
                 },
                 accesses: vec![pest::Access::Call(pest::CallAccess {
-                    expressions: vec![],
+                    explicit_generics: None,
+                    arguments: pest::Arguments {
+                        expressions: vec![],
+                        span: span.clone(),
+                    },
                     span: span.clone(),
                 })],
                 span: span.clone(),

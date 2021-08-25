@@ -52,16 +52,6 @@ pub fn subcommand() -> App<'static, 'static> {
                 .possible_values(constants::SCHEMES)
                 .default_value(constants::G16),
         )
-        .arg(
-            Arg::with_name("solidity-abi")
-                .short("a")
-                .long("solidity-abi")
-                .help("Flag for setting the version of the ABI Encoder used in the contract")
-                .takes_value(true)
-                .possible_values(&["v1", "v2"])
-                .default_value("v1")
-                .required(false),
-        )
 }
 
 pub fn exec(sub_matches: &ArgMatches) -> Result<(), String> {
@@ -93,20 +83,18 @@ fn cli_export_verifier<T: SolidityCompatibleField, S: SolidityCompatibleScheme<T
     // read vk file
     let input_path = Path::new(sub_matches.value_of("input").unwrap());
     let input_file = File::open(&input_path)
-        .map_err(|why| format!("Couldn't open {}: {}", input_path.display(), why))?;
+        .map_err(|why| format!("Could not open {}: {}", input_path.display(), why))?;
     let reader = BufReader::new(input_file);
 
     let vk = serde_json::from_reader(reader)
-        .map_err(|why| format!("Couldn't deserialize verifying key: {}", why))?;
+        .map_err(|why| format!("Could not deserialize verification key: {}", why))?;
 
-    let abi = SolidityAbi::from(sub_matches.value_of("solidity-abi").unwrap())?;
-
-    let verifier = S::export_solidity_verifier(vk, abi);
+    let verifier = S::export_solidity_verifier(vk);
 
     //write output file
     let output_path = Path::new(sub_matches.value_of("output").unwrap());
     let output_file = File::create(&output_path)
-        .map_err(|why| format!("Couldn't create {}: {}", output_path.display(), why))?;
+        .map_err(|why| format!("Could not create {}: {}", output_path.display(), why))?;
 
     let mut writer = BufWriter::new(output_file);
 
@@ -114,6 +102,6 @@ fn cli_export_verifier<T: SolidityCompatibleField, S: SolidityCompatibleScheme<T
         .write_all(&verifier.as_bytes())
         .map_err(|_| "Failed writing output to file".to_string())?;
 
-    println!("Finished exporting verifier");
+    println!("Verifier exported to '{}'", output_path.display());
     Ok(())
 }

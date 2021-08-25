@@ -56,10 +56,20 @@ pub fn subcommand() -> App<'static, 'static> {
         .long("allow-unconstrained-variables")
         .help("Allow unconstrained variables by inserting dummy constraints")
         .required(false)
-    ).arg(Arg::with_name("light")
-        .long("light")
-        .help("Skip logs and human readable output")
+    ).arg(Arg::with_name("isolate-branches")
+        .long("isolate-branches")
+        .help("Isolate the execution of branches: a panic in a branch only makes the program panic if this branch is being logically executed")
         .required(false)
+    ).arg(Arg::with_name("ztf")
+        .long("ztf")
+        .help("Write human readable output (ztf)")
+        .required(false)
+    )
+    .arg(Arg::with_name("light") // TODO: deprecated, should be removed
+        .long("light")
+        .required(false)
+        .overrides_with_all(&["ztf", "verbose"])
+        .hidden(true)
     )
 }
 
@@ -74,16 +84,25 @@ pub fn exec(sub_matches: &ArgMatches) -> Result<(), String> {
 }
 
 fn cli_compile<T: Field>(sub_matches: &ArgMatches) -> Result<(), String> {
-    println!("Compiling {}\n", sub_matches.value_of("input").unwrap());
+    // TODO: remove the warning once light flag is removed entirely
+    if sub_matches.is_present("light") {
+        println!(
+            "Warning: the --light flag is deprecated and will be removed in a coming release.\n\
+            Terminal output is now off by default and can be activated with the --verbose flag.\n\
+            Human-readable output file (ztf) is now off by default and can be activated with the --ztf flag.\n"
+        )
+    }
 
+    println!("Compiling {}\n", sub_matches.value_of("input").unwrap());
     let path = PathBuf::from(sub_matches.value_of("input").unwrap());
-    let light = sub_matches.occurrences_of("light") > 0;
     let bin_output_path = Path::new(sub_matches.value_of("output").unwrap());
     let abi_spec_path = Path::new(sub_matches.value_of("abi-spec").unwrap());
     let hr_output_path = bin_output_path.to_path_buf().with_extension("ztf");
 
+    log::debug!("Load entry point file {}", path.display());
+
     let file = File::open(path.clone())
-        .map_err(|why| format!("Couldn't open input file {}: {}", path.display(), why))?;
+        .map_err(|why| format!("Could not open {}: {}", path.display(), why))?;
 
     let mut reader = BufReader::new(file);
     let mut source = String::new();
@@ -94,7 +113,7 @@ fn cli_compile<T: Field>(sub_matches: &ArgMatches) -> Result<(), String> {
         format!(
             "{}:{}",
             file.strip_prefix(std::env::current_dir().unwrap())
-                .unwrap_or(file.as_path())
+                .unwrap_or_else(|_| file.as_path())
                 .display(),
             e.value()
         )
@@ -109,11 +128,14 @@ fn cli_compile<T: Field>(sub_matches: &ArgMatches) -> Result<(), String> {
         )),
     }?;
 
-    let config = CompileConfig {
-        allow_unconstrained_variables: sub_matches.is_present("allow-unconstrained-variables"),
-    };
+    let config = CompileConfig::default()
+        .allow_unconstrained_variables(sub_matches.is_present("allow-unconstrained-variables"))
+        .isolate_branches(sub_matches.is_present("isolate-branches"));
 
     let resolver = FileSystemResolver::with_stdlib_root(stdlib_path);
+
+    log::debug!("Compile");
+
     let artifacts: CompilationArtifacts<T> = compile(source, path, Some(&resolver), &config)
         .map_err(|e| {
             format!(
@@ -131,44 +153,44 @@ fn cli_compile<T: Field>(sub_matches: &ArgMatches) -> Result<(), String> {
     let num_constraints = program_flattened.constraint_count();
 
     // serialize flattened program and write to binary file
+    log::debug!("Serialize program");
     let bin_output_file = File::create(&bin_output_path)
-        .map_err(|why| format!("Couldn't create {}: {}", bin_output_path.display(), why))?;
+        .map_err(|why| format!("Could not create {}: {}", bin_output_path.display(), why))?;
 
     let mut writer = BufWriter::new(bin_output_file);
 
     program_flattened.serialize(&mut writer);
 
     // serialize ABI spec and write to JSON file
+    log::debug!("Serialize ABI");
     let abi_spec_file = File::create(&abi_spec_path)
-        .map_err(|why| format!("Couldn't create {}: {}", abi_spec_path.display(), why))?;
+        .map_err(|why| format!("Could not create {}: {}", abi_spec_path.display(), why))?;
 
     let abi = artifacts.abi();
 
     let mut writer = BufWriter::new(abi_spec_file);
-
     to_writer_pretty(&mut writer, &abi).map_err(|_| "Unable to write data to file.".to_string())?;
 
-    if !light {
-        // write human-readable output file
-        let hr_output_file = File::create(&hr_output_path)
-            .map_err(|why| format!("Couldn't create {}: {}", hr_output_path.display(), why))?;
-
-        let mut hrofb = BufWriter::new(hr_output_file);
-        write!(&mut hrofb, "{}\n", program_flattened)
-            .map_err(|_| "Unable to write data to file".to_string())?;
-        hrofb
-            .flush()
-            .map_err(|_| "Unable to flush buffer".to_string())?;
-    }
-
-    if !light {
+    if sub_matches.is_present("verbose") {
         // debugging output
         println!("Compiled program:\n{}", program_flattened);
     }
 
     println!("Compiled code written to '{}'", bin_output_path.display());
 
-    if !light {
+    if sub_matches.is_present("ztf") {
+        // write human-readable output file
+        log::debug!("Serialize human readable program");
+        let hr_output_file = File::create(&hr_output_path)
+            .map_err(|why| format!("Could not create {}: {}", hr_output_path.display(), why))?;
+
+        let mut hrofb = BufWriter::new(hr_output_file);
+        writeln!(&mut hrofb, "{}", program_flattened)
+            .map_err(|_| "Unable to write data to file".to_string())?;
+        hrofb
+            .flush()
+            .map_err(|_| "Unable to flush buffer".to_string())?;
+
         println!("Human readable code to '{}'", hr_output_path.display());
     }
 
